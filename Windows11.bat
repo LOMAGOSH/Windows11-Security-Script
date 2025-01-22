@@ -23,14 +23,11 @@ set /p answer=Have you answered all the forensics questions?[y/n]:
 :menu
 cls
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo " __        __   ______   __       _______  __     __  "
-echo "|  \  _   |  \ /      \ |  \     |       \|  \   |  \ "
-echo "| $$ / \  | $$|  $$$$$$\| $$     | $$$$$$$\\$$\ /  $$ "
-echo "| $$/  $\ | $$| $$   \$$| $$     | $$__/ $$ \$$\  $$  "
-echo "| $$  $$$\| $$| $$      | $$     | $$    $$  \$$ $$   "
-echo "| $$ $$\$$\$$| $$   __  | $$     | $$$$$$$\   \$$$    "
-echo "| $$$$  \$$$$| $$__/  \ | $$_____| $$__/ $$    \$     "
-echo " \$$    \____ \$$    $$ \$$     \$$    $$     \$$    "
+echo "        W       W      CCCCC"
+echo "        W       W     C     "
+echo "        W   W   W    C      "
+echo "         W W W W     C      "
+echo "          W   W       CCCCC"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo "                            ~Written by: W C~                                "
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -45,6 +42,7 @@ echo "15) Audit the machine        16) Edit groups"
 echo "69) Exit                     70) Reboot"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 set /p answer=Please choose an option:
+
         if "%answer%"=="1" goto :userProp
         if "%answer%"=="2" goto :createUser
         if "%answer%"=="3" goto :disUser
