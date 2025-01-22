@@ -180,6 +180,14 @@ goto :menu
 :firewall
 echo Configuring Windows Defender Firewall...
 
+:: Ensure the Windows Firewall service is running
+sc start mpssvc >nul 2>&1
+if %errorlevel% NEQ 0 (
+    echo Failed to start the Windows Firewall service. Please ensure it is enabled.
+    pause
+    goto :menu
+)
+
 :: Turn on the firewall for Domain, Private, and Public profiles
 netsh advfirewall set domainprofile state on
 netsh advfirewall set privateprofile state on
@@ -190,17 +198,17 @@ netsh advfirewall set domainprofile firewallpolicy blockinbound,allowoutbound
 netsh advfirewall set privateprofile firewallpolicy blockinbound,allowoutbound
 netsh advfirewall set publicprofile firewallpolicy blockinbound,allowoutbound
 
-:: Enable logging for dropped connections (optional)
+:: Enable logging for dropped connections
 netsh advfirewall set domainprofile logging droppedconnections enable
 netsh advfirewall set privateprofile logging droppedconnections enable
 netsh advfirewall set publicprofile logging droppedconnections enable
 
-:: Enable logging for allowed connections (optional)
+:: Enable logging for allowed connections
 netsh advfirewall set domainprofile logging allowedconnections enable
 netsh advfirewall set privateprofile logging allowedconnections enable
 netsh advfirewall set publicprofile logging allowedconnections enable
 
-:: Specify log file size (optional)
+:: Specify log file size
 netsh advfirewall set domainprofile logging maxfilesize 32767
 netsh advfirewall set privateprofile logging maxfilesize 32767
 netsh advfirewall set publicprofile logging maxfilesize 32767
@@ -208,6 +216,7 @@ netsh advfirewall set publicprofile logging maxfilesize 32767
 echo Windows Defender Firewall has been successfully configured!
 pause
 goto :menu
+
 
 
 :UAC
