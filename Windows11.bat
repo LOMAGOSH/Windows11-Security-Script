@@ -227,10 +227,23 @@ goto :menu
     goto :menu
 
 :autoUpdate
-    echo Enabling automatic updates
-    reg ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" /v AUOptions /t REG_DWORD /d 4 /f
-    pause
-    goto :menu
+echo Configuring Automatic Updates...
+
+:: Set the Windows Update to Automatic (Registry)
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" /v AUOptions /t REG_DWORD /d 4 /f
+
+:: Enable Automatic Updates Service
+sc config wuauserv start= auto
+net start wuauserv
+
+:: Ensure Background Intelligent Transfer Service (BITS) is running
+sc config bits start= auto
+net start bits
+
+echo Automatic Updates have been successfully enabled!
+pause
+goto :menu
+
 
 :audit
 echo Configuring Audit Policy...
