@@ -23,13 +23,13 @@ set /p answer=Have you answered all the forensics questions?[y/n]:
 :menu
 cls
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "        W       W      CCCCC"
-echo "        W       W     C     "
-echo "        W   W   W    C      "
-echo "         W W W W     C      "
-echo "          W   W       CCCCC"
+echo "  ██████   ██   ██  ███████  ███    ██  ████████"
+echo " ██        ██   ██  ██       ████   ██     ██   "
+echo " ██  ███   ███████  █████    ██ ██  ██     ██   "
+echo " ██   ██   ██   ██  ██       ██  ██ ██     ██   "
+echo "  ██████   ██   ██  ███████  ██   ████     ██   "
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "                            ~Written by: W C~                                "
+echo "                            ~Written by: GHENT~                              "
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo "1) Set user properties       2) Create a user"
 echo "3) Disable a user            4) Change all passwords"
@@ -42,6 +42,7 @@ echo "15) Audit the machine        16) Edit groups"
 echo "69) Exit                     70) Reboot"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 set /p answer=Please choose an option:
+
 
         if "%answer%"=="1" goto :userProp
         if "%answer%"=="2" goto :createUser
