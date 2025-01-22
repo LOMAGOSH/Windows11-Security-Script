@@ -235,36 +235,37 @@ goto :menu
 :audit
 echo Configuring Audit Policy...
 
-:: Enable auditing for account logon events (Success and Failure)
+:: Enable auditing for Account Logon events (Success and Failure)
 auditpol /set /subcategory:"Account Logon" /success:enable /failure:enable
 
-:: Enable auditing for account management (Success and Failure)
+:: Enable auditing for Account Management events (Success and Failure)
 auditpol /set /subcategory:"Account Management" /success:enable /failure:enable
 
-:: Enable auditing for directory service access (Success and Failure)
+:: Enable auditing for Directory Service Access (Success and Failure)
 auditpol /set /subcategory:"Directory Service Access" /success:enable /failure:enable
 
-:: Enable auditing for logon events (Success and Failure)
+:: Enable auditing for Logon events (Success and Failure)
 auditpol /set /subcategory:"Logon" /success:enable /failure:enable
 
-:: Enable auditing for object access (Success and Failure)
+:: Enable auditing for Object Access (Success and Failure)
 auditpol /set /subcategory:"Object Access" /success:enable /failure:enable
 
-:: Enable auditing for policy change (Success and Failure)
+:: Enable auditing for Policy Change (Success and Failure)
 auditpol /set /subcategory:"Policy Change" /success:enable /failure:enable
 
-:: Enable auditing for privilege use (Success and Failure)
+:: Enable auditing for Privilege Use (Success and Failure)
 auditpol /set /subcategory:"Privilege Use" /success:enable /failure:enable
 
-:: Enable auditing for process tracking (Success and Failure)
+:: Enable auditing for Process Tracking (Success and Failure)
 auditpol /set /subcategory:"Process Tracking" /success:enable /failure:enable
 
-:: Enable auditing for system events (Success and Failure)
+:: Enable auditing for System Events (Success and Failure)
 auditpol /set /subcategory:"System" /success:enable /failure:enable
 
 echo Audit Policy has been successfully configured!
 pause
 goto :menu
+
 
 
 :group
