@@ -21,28 +21,30 @@ set /p answer=Have you answered all the forensics questions?[y/n]:
     )
     
 :menu
-    cls
-    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    echo " _______  ______     ___     __      __     _____   _     _  _______  ______ "
-    echo "[__   __][  ____]   [ _ ]   [  ]    [  ]   [  __ ] [ ]   [ ][__   __][  ____]"
-    echo "   [ ]   [ ]___    [ [_] ]  [ _ ]  [ _ ]   [ ]__] ] [ ]_[ ]    [ ]   [ ]___  "
-    echo "   [ ]   [  ___]  [ _____ ] [ ][ ][ ][ ]   [  __ ]   [   ]     [ ]   [  ___] "
-    echo "   [ ]   [ ]____ [ ]     [ ][ ] [__] [ ]   [ ]__] ]   [ ]      [ ]   [ ]____ "
-    echo "   [_]   [______][_]     [_][_]      [_]   [_____]    [_]      [_]   [______]"
-    echo "                                                                             " 
-    echo "~~~~~~~~~~~~~~~~~~~~~Written by: WC~~~~~~~~~~~~~~~~~~~~~~"
-    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    echo "1) Set user properties        2) Create a user"
-    echo "3) Disable a user            4) Change all passwords"
-    echo "5) Disable guest/admin       6) Set password policy"
-    echo "7) Set lockout policy        8) Enable Firewall"
-    echo "9) Search for media files    10) Disable services"
-    echo "11) Turn on UAC              12) Remote Desktop Config"
-    echo "13) Enable auto update       14) Security options"
-    echo "15) Audit the machine        16) Edit groups"
-    echo "69) Exit                     70) Reboot"
-    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    set /p answer=Please choose an option: 
+cls
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo " __        __   ______   __       _______  __     __  "
+echo "|  \  _   |  \ /      \ |  \     |       \|  \   |  \ "
+echo "| $$ / \  | $$|  $$$$$$\| $$     | $$$$$$$\\$$\ /  $$ "
+echo "| $$/  $\ | $$| $$   \$$| $$     | $$__/ $$ \$$\  $$  "
+echo "| $$  $$$\| $$| $$      | $$     | $$    $$  \$$ $$   "
+echo "| $$ $$\$$\$$| $$   __  | $$     | $$$$$$$\   \$$$    "
+echo "| $$$$  \$$$$| $$__/  \ | $$_____| $$__/ $$    \$     "
+echo " \$$    \____ \$$    $$ \$$     \$$    $$     \$$    "
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "                            ~Written by: W C~                                "
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "1) Set user properties       2) Create a user"
+echo "3) Disable a user            4) Change all passwords"
+echo "5) Disable guest/admin       6) Set password policy"
+echo "7) Set lockout policy        8) Enable Firewall"
+echo "9) Search for media files    10) Disable services"
+echo "11) Turn on UAC              12) Remote Desktop Config"
+echo "13) Enable auto update       14) Security options"
+echo "15) Audit the machine        16) Edit groups"
+echo "69) Exit                     70) Reboot"
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+set /p answer=Please choose an option:
         if "%answer%"=="1" goto :userProp
         if "%answer%"=="2" goto :createUser
         if "%answer%"=="3" goto :disUser
