@@ -180,24 +180,35 @@ goto :menu
 :firewall
 echo Configuring Windows Defender Firewall...
 
-:: Turn on Windows Defender Firewall for Domain, Private, and Public profiles
+:: Turn on the firewall for Domain, Private, and Public profiles
 netsh advfirewall set domainprofile state on
 netsh advfirewall set privateprofile state on
 netsh advfirewall set publicprofile state on
 
-:: Block inbound connections that do not match a rule for all profiles
+:: Configure firewall policy: block inbound, allow outbound
 netsh advfirewall set domainprofile firewallpolicy blockinbound,allowoutbound
 netsh advfirewall set privateprofile firewallpolicy blockinbound,allowoutbound
 netsh advfirewall set publicprofile firewallpolicy blockinbound,allowoutbound
 
-:: Allow outbound connections that do not match a rule for all profiles
-netsh advfirewall set domainprofile default outbound allow
-netsh advfirewall set privateprofile default outbound allow
-netsh advfirewall set publicprofile default outbound allow
+:: Enable logging for dropped connections (optional)
+netsh advfirewall set domainprofile logging droppedconnections enable
+netsh advfirewall set privateprofile logging droppedconnections enable
+netsh advfirewall set publicprofile logging droppedconnections enable
+
+:: Enable logging for allowed connections (optional)
+netsh advfirewall set domainprofile logging allowedconnections enable
+netsh advfirewall set privateprofile logging allowedconnections enable
+netsh advfirewall set publicprofile logging allowedconnections enable
+
+:: Specify log file size (optional)
+netsh advfirewall set domainprofile logging maxfilesize 32767
+netsh advfirewall set privateprofile logging maxfilesize 32767
+netsh advfirewall set publicprofile logging maxfilesize 32767
 
 echo Windows Defender Firewall has been successfully configured!
 pause
 goto :menu
+
 
 :UAC
     echo Enabling User Account Control (UAC)
