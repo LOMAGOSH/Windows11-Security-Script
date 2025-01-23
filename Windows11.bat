@@ -436,40 +436,12 @@ goto :menu
 	goto :menu
 
 :audit
-echo Configuring Audit Policy...
-
-:: System Subcategory: Enable auditing for System Integrity and Other System Events
-auditpol /set /subcategory:"System Integrity" /success:enable /failure:enable
-auditpol /set /subcategory:"Other System Events" /success:enable /failure:enable
-
-:: Logon/Logoff Subcategories: Enable auditing for Logon and Logoff
-auditpol /set /subcategory:"Logon" /success:enable /failure:enable
-auditpol /set /subcategory:"Logoff" /success:enable /failure:enable
-auditpol /set /subcategory:"Account Lockout" /success:enable /failure:enable
-auditpol /set /subcategory:"Special Logon" /success:enable /failure:enable
-
-:: Object Access Subcategories: Enable auditing for File System and Registry
-auditpol /set /subcategory:"File System" /success:enable /failure:enable
-auditpol /set /subcategory:"Registry" /success:enable /failure:enable
-
-:: Privilege Use Subcategory: Enable auditing for Sensitive Privilege Use
-auditpol /set /subcategory:"Sensitive Privilege Use" /success:enable /failure:enable
-
-:: Detailed Tracking Subcategory: Enable auditing for Process Creation
-auditpol /set /subcategory:"Process Creation" /success:enable /failure:enable
-
-:: Policy Change Subcategories: Enable auditing for Audit Policy Change
-auditpol /set /subcategory:"Audit Policy Change" /success:enable /failure:enable
-
-:: Account Management Subcategories: Enable auditing for User Account Management
-auditpol /set /subcategory:"User Account Management" /success:enable /failure:enable
-
-:: Account Logon Subcategory: Enable auditing for Credential Validation
-auditpol /set /subcategory:"Credential Validation" /success:enable /failure:enable
-
-echo Audit Policy has been successfully configured!
-pause
-goto :menu
+	echo Auditing the maching now
+	auditpol /set /category:* /success:enable
+	auditpol /set /category:* /failure:enable
+	
+	pause
+	goto :menu
 
 
 
