@@ -436,10 +436,76 @@ goto :menu
 	goto :menu
 
 :audit
-	echo Auditing the maching now
+	echo Auditing the machine now
 	auditpol /set /category:* /success:enable
 	auditpol /set /category:* /failure:enable
-	
+
+	:: Account Logon
+	auditpol /set /subcategory:"Credential Validation" /success:enable /failure:enable
+	auditpol /set /subcategory:"Kerberos Authentication Service" /success:enable /failure:enable
+	auditpol /set /subcategory:"Kerberos Service Ticket Operations" /success:enable /failure:enable
+	auditpol /set /subcategory:"Other Account Logon Events" /success:enable /failure:enable
+
+	:: Account Management
+	auditpol /set /subcategory:"Application Group Management" /success:enable /failure:enable
+	auditpol /set /subcategory:"Computer Account Management" /success:enable /failure:enable
+	auditpol /set /subcategory:"Distribution Group Management" /success:enable /failure:enable
+	auditpol /set /subcategory:"Other Account Management Events" /success:enable /failure:enable
+	auditpol /set /subcategory:"Security Group Management" /success:enable /failure:enable
+	auditpol /set /subcategory:"User Account Management" /success:enable /failure:enable
+
+	:: Detailed Tracking
+	auditpol /set /subcategory:"DPAPI Activity" /success:enable /failure:enable
+	auditpol /set /subcategory:"PNP Activity" /success:enable /failure:enable
+	auditpol /set /subcategory:"Process Creation" /success:enable /failure:enable
+	auditpol /set /subcategory:"Process Termination" /success:enable /failure:enable
+	auditpol /set /subcategory:"RPC Events" /success:enable /failure:enable
+	auditpol /set /subcategory:"Token Right Adjusted" /success:enable /failure:enable
+
+	:: DS Access
+	auditpol /set /subcategory:"Directory Service Access" /success:enable /failure:enable
+	auditpol /set /subcategory:"Directory Service Changes" /success:enable /failure:enable
+	auditpol /set /subcategory:"Directory Service Replication" /success:enable /failure:enable
+	auditpol /set /subcategory:"Detailed Directory Service Replication" /success:enable /failure:enable
+
+	:: Logon/Logoff
+	auditpol /set /subcategory:"Account Lockout" /success:enable /failure:enable
+	auditpol /set /subcategory:"Logoff" /success:enable /failure:enable
+	auditpol /set /subcategory:"Logon" /success:enable /failure:enable
+	auditpol /set /subcategory:"Special Logon" /success:enable /failure:enable
+	auditpol /set /subcategory:"Network Policy Server" /success:enable /failure:enable
+	auditpol /set /subcategory:"Other Logon/Logoff Events" /success:enable /failure:enable
+
+	:: Object Access
+	auditpol /set /subcategory:"File System" /success:enable /failure:enable
+	auditpol /set /subcategory:"Registry" /success:enable /failure:enable
+	auditpol /set /subcategory:"Kernel Object" /success:enable /failure:enable
+	auditpol /set /subcategory:"Removable Storage" /success:enable /failure:enable
+	auditpol /set /subcategory:"Central Access Policy Staging" /success:enable /failure:enable
+
+	:: Policy Change
+	auditpol /set /subcategory:"Audit Policy Change" /success:enable /failure:enable
+	auditpol /set /subcategory:"Authentication Policy Change" /success:enable /failure:enable
+	auditpol /set /subcategory:"Authorization Policy Change" /success:enable /failure:enable
+	auditpol /set /subcategory:"Filtering Platform Policy Change" /success:enable /failure:enable
+	auditpol /set /subcategory:"MPSSVC Rule-Level Policy Change" /success:enable /failure:enable
+	auditpol /set /subcategory:"Other Policy Change Events" /success:enable /failure:enable
+
+	:: Privilege Use
+	auditpol /set /subcategory:"Non Sensitive Privilege Use" /success:enable /failure:enable
+	auditpol /set /subcategory:"Other Privilege Use Events" /success:enable /failure:enable
+	auditpol /set /subcategory:"Sensitive Privilege Use" /success:enable /failure:enable
+
+	:: System
+	auditpol /set /subcategory:"IPsec Driver" /success:enable /failure:enable
+	auditpol /set /subcategory:"Other System Events" /success:enable /failure:enable
+	auditpol /set /subcategory:"Security State Change" /success:enable /failure:enable
+	auditpol /set /subcategory:"Security System Extension" /success:enable /failure:enable
+	auditpol /set /subcategory:"System Integrity" /success:enable /failure:enable
+
+	:: Leave Global Object Access Auditing Not Configured
+	echo Global Object Access Auditing is not configured as requested.
+
 	pause
 	goto :menu
 
