@@ -218,42 +218,85 @@ pause
 goto :menu
 
 :services
-	echo Disabling Services
-	sc stop TapiSrv
-	sc config TapiSrv start= disabled
-	sc stop TlntSvr
-	sc config TlntSvr start= disabled
-	sc stop ftpsvc
-	sc config ftpsvc start= disabled
-	sc stop SNMP
-	sc config SNMP start= disabled
-	sc stop SessionEnv
-	sc config SessionEnv start= disabled
-	sc stop TermService
-	sc config TermService start= disabled
-	sc stop UmRdpService
-	sc config UmRdpService start= disabled
-	sc stop SharedAccess
-	sc config SharedAccess start= disabled
-	sc stop remoteRegistry 
-	sc config remoteRegistry start= disabled
-	sc stop SSDPSRV
-	sc config SSDPSRV start= disabled
-	sc stop W3SVC
-	sc config W3SVC start= disabled
-	sc stop SNMPTRAP
-	sc config SNMPTRAP start= disabled
-	sc stop remoteAccess
-	sc config remoteAccess start= disabled
-	sc stop RpcSs
-	sc config RpcSs start= disabled
-	sc stop HomeGroupProvider
-	sc config HomeGroupProvider start= disabled
-	sc stop HomeGroupListener
-	sc config HomeGroupListener start= disabled
-	
-	pause
-	goto :menu
+echo Disabling unnecessary services...
+
+:: Windows Remote Management
+sc config WinRM start= disabled
+sc stop WinRM
+
+:: SSDP Discovery
+sc config SSDPSRV start= disabled
+sc stop SSDPSRV
+
+:: Remote Registry
+sc config RemoteRegistry start= disabled
+sc stop RemoteRegistry
+
+:: Windows Error Reporting
+sc config WerSvc start= disabled
+sc stop WerSvc
+
+:: Xbox Live Networking Service
+sc config XboxNetApiSvc start= disabled
+sc stop XboxNetApiSvc
+
+:: Xbox Live Auth Manager
+sc config XblAuthManager start= disabled
+sc stop XblAuthManager
+
+:: Xbox Game Save
+sc config XblGameSave start= disabled
+sc stop XblGameSave
+
+:: Windows Media Player Network Sharing
+sc config WMPNetworkSvc start= disabled
+sc stop WMPNetworkSvc
+
+:: Diagnostic Service Host
+sc config WdiServiceHost start= disabled
+sc stop WdiServiceHost
+
+:: Additional Non-Critical Services
+:: Bluetooth Support Service
+sc config bthserv start= disabled
+sc stop bthserv
+
+:: AllJoyn Router Service
+sc config AJRouter start= disabled
+sc stop AJRouter
+
+:: Downloaded Maps Manager
+sc config MapsBroker start= disabled
+sc stop MapsBroker
+
+:: Internet Connection Sharing (ICS)
+sc config SharedAccess start= disabled
+sc stop SharedAccess
+
+:: Fax Service
+sc config Fax start= disabled
+sc stop Fax
+
+:: Device Management Enrollment Service
+sc config DmEnrollmentSvc start= disabled
+sc stop DmEnrollmentSvc
+
+:: Windows Event Collector
+sc config Wecsvc start= disabled
+sc stop Wecsvc
+
+:: Sensor Monitoring Service
+sc config SensorService start= disabled
+sc stop SensorService
+
+:: Shell Hardware Detection
+sc config ShellHWDetection start= disabled
+sc stop ShellHWDetection
+
+echo All unnecessary services have been stopped and disabled.
+pause
+goto :menu
+
 
 :UAC
     echo Enabling User Account Control (UAC)
