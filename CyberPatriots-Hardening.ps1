@@ -632,4 +632,11 @@ do {
         '14' { Edit-Groups }
         '15' { Set-AdvancedSecurity }
         '16' { Set-ApacheSecurity }
-        '
+        '69' { exit }
+        '70' { Restart-Computer -Force }
+        default { 
+            Write-Host "Invalid option. Please try again." -ForegroundColor Red
+            Start-Sleep -Seconds 2
+        }
+    }
+} while ($true)
