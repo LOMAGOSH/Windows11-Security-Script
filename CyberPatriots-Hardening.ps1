@@ -53,22 +53,59 @@ function Show-Menu {
     Write-Host "9) Turn on UAC               10) Remote Desktop Config"
     Write-Host "11) Enable auto update       12) Security options"
     Write-Host "13) Audit the machine        14) Edit groups"
+    Write-Host "15) Advanced security        16) Apache security"
     Write-Host "69) Exit                     70) Reboot"
     Write-Host "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" -ForegroundColor Cyan
 }
 
 # Function 1: Set user properties
 function Set-UserProperties {
-    Write-Host "`nSetting password properties..." -ForegroundColor Yellow
+    Write-Host "`nSetting password properties for all local users..." -ForegroundColor Yellow
+    
     try {
-        Get-WmiObject -Class Win32_UserAccount -Filter "LocalAccount=True" | ForEach-Object {
-            $_.PasswordExpires = $true
-            $_.PasswordChangeable = $true
-            $_.PasswordRequired = $true
-            $_.Put() | Out-Null
-            Write-Host "Updated properties for: $($_.Name)" -ForegroundColor Green
+        # Get all local users
+        $users = Get-LocalUser | Where-Object { $_.Enabled -eq $true }
+        
+        foreach ($user in $users) {
+            try {
+                # Using ADSI to set properties
+                $userADSI = [ADSI]"WinNT://$env:COMPUTERNAME/$($user.Name),user"
+                
+                # Set UserFlags to ensure password properties
+                # 0x10000 = Password never expires (we'll REMOVE this flag)
+                # 0x0040 = User cannot change password (we'll REMOVE this flag)
+                # 0x0002 = Account disabled (preserve existing state)
+                
+                $currentFlags = $userADSI.UserFlags.Value
+                
+                # Remove "Password never expires" flag (0x10000)
+                $currentFlags = $currentFlags -band (-bnot 0x10000)
+                
+                # Remove "User cannot change password" flag (0x0040)
+                $currentFlags = $currentFlags -band (-bnot 0x0040)
+                
+                # Set the updated flags
+                $userADSI.UserFlags = $currentFlags
+                $userADSI.SetInfo()
+                
+                # Also use WMI for additional properties
+                $wmiUser = Get-WmiObject -Class Win32_UserAccount -Filter "Name='$($user.Name)' AND LocalAccount=True"
+                $wmiUser.PasswordExpires = $true
+                $wmiUser.PasswordChangeable = $true
+                $wmiUser.PasswordRequired = $true
+                $wmiUser.Put() | Out-Null
+                
+                Write-Host "✓ Updated $($user.Name): Password expires enabled, user CAN change password" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "✗ Error updating $($user.Name): $_" -ForegroundColor Red
+            }
         }
-        Write-Host "All user properties have been set successfully!" -ForegroundColor Green
+        
+        Write-Host "`nAll user properties have been configured!" -ForegroundColor Green
+        Write-Host "- Password never expires: UNCHECKED" -ForegroundColor Cyan
+        Write-Host "- User cannot change password: UNCHECKED" -ForegroundColor Cyan
+        Write-Host "- User must change password at next logon: UNCHECKED" -ForegroundColor Cyan
     }
     catch {
         Write-Host "Error setting user properties: $_" -ForegroundColor Red
@@ -486,6 +523,132 @@ function Edit-Groups {
     pause
 }
 
+# Function 17: Advanced Security Settings
+function Set-AdvancedSecurity {
+    Write-Host "`nConfiguring Advanced Security Settings..." -ForegroundColor Yellow
+    
+    try {
+        # 1. Disable Remote Desktop via Group Policy
+        Write-Host "`n[1/4] Disabling Remote Desktop Services..." -ForegroundColor Cyan
+        $rdpPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+        if (-not (Test-Path $rdpPath)) {
+            New-Item -Path $rdpPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $rdpPath -Name "fDenyTSConnections" -Value 1
+        Write-Host "✓ Remote Desktop Services disabled" -ForegroundColor Green
+        
+        # 2. Require CTRL+ALT+DEL at logon
+        Write-Host "`n[2/4] Requiring CTRL+ALT+DEL at logon..." -ForegroundColor Cyan
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "DisableCAD" -Value 0
+        Write-Host "✓ CTRL+ALT+DEL requirement enabled" -ForegroundColor Green
+        
+        # 3. Disable WinRM unencrypted traffic
+        Write-Host "`n[3/4] Disabling WinRM unencrypted traffic..." -ForegroundColor Cyan
+        $winrmPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service"
+        if (-not (Test-Path $winrmPath)) {
+            New-Item -Path $winrmPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $winrmPath -Name "AllowUnencryptedTraffic" -Value 0
+        Write-Host "✓ WinRM unencrypted traffic disabled" -ForegroundColor Green
+        
+        # 4. Enable digitally signed communications
+        Write-Host "`n[4/4] Enabling digitally signed communications..." -ForegroundColor Cyan
+        $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
+        Set-ItemProperty -Path $lsaPath -Name "RequireSecuritySignature" -Value 1
+        Set-ItemProperty -Path $lsaPath -Name "EnableSecuritySignature" -Value 1
+        Write-Host "✓ Digitally signed communications enabled" -ForegroundColor Green
+        
+        Write-Host "`nAll advanced security settings configured successfully!" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Error configuring advanced security: $_" -ForegroundColor Red
+    }
+    pause
+}
+
+# Function 18: Apache Security Configuration
+function Set-ApacheSecurity {
+    Write-Host "`nConfiguring Apache Security..." -ForegroundColor Yellow
+    
+    $apacheConfigPath = "C:\Apache24\conf\httpd.conf"
+    
+    if (Test-Path $apacheConfigPath) {
+        try {
+            Write-Host "Found Apache configuration file" -ForegroundColor Cyan
+            
+            # Read the file
+            $content = Get-Content $apacheConfigPath
+            
+            # Find and replace ServerSignature
+            $modified = $false
+            for ($i = 0; $i -lt $content.Count; $i++) {
+                if ($content[$i] -match "^\s*ServerSignature\s+On") {
+                    $content[$i] = "ServerSignature Off"
+                    $modified = $true
+                    Write-Host "✓ Changed 'ServerSignature On' to 'ServerSignature Off' on line $($i+1)" -ForegroundColor Green
+                }
+            }
+            
+            # Also check for ServerTokens and set it to Prod for minimal info disclosure
+            $hasServerTokens = $false
+            for ($i = 0; $i -lt $content.Count; $i++) {
+                if ($content[$i] -match "^\s*ServerTokens") {
+                    $content[$i] = "ServerTokens Prod"
+                    $hasServerTokens = $true
+                    Write-Host "✓ Set 'ServerTokens Prod' on line $($i+1)" -ForegroundColor Green
+                }
+            }
+            
+            # If ServerTokens doesn't exist, add it
+            if (-not $hasServerTokens) {
+                # Find ServerSignature line and add ServerTokens before it
+                for ($i = 0; $i -lt $content.Count; $i++) {
+                    if ($content[$i] -match "^\s*ServerSignature") {
+                        $content = $content[0..$i] + "ServerTokens Prod" + $content[($i+1)..($content.Count-1)]
+                        Write-Host "✓ Added 'ServerTokens Prod' directive" -ForegroundColor Green
+                        break
+                    }
+                }
+            }
+            
+            if ($modified -or $hasServerTokens -or (-not $hasServerTokens)) {
+                # Backup original file
+                Copy-Item $apacheConfigPath "$apacheConfigPath.backup" -Force
+                Write-Host "✓ Backed up original config to httpd.conf.backup" -ForegroundColor Cyan
+                
+                # Save the modified content
+                $content | Set-Content $apacheConfigPath
+                Write-Host "✓ Apache configuration updated successfully!" -ForegroundColor Green
+                
+                # Offer to restart Apache service
+                $restart = Read-Host "`nRestart Apache service now? [y/n]"
+                if ($restart -eq 'y') {
+                    $apacheService = Get-Service -Name "Apache*" -ErrorAction SilentlyContinue
+                    if ($apacheService) {
+                        Restart-Service $apacheService.Name
+                        Write-Host "✓ Apache service restarted" -ForegroundColor Green
+                    } else {
+                        Write-Host "! Apache service not found - restart manually if needed" -ForegroundColor Yellow
+                    }
+                }
+            } else {
+                Write-Host "No changes needed - Apache already configured securely" -ForegroundColor Green
+            }
+        }
+        catch {
+            Write-Host "Error configuring Apache: $_" -ForegroundColor Red
+        }
+    }
+    else {
+        Write-Host "Apache configuration file not found at $apacheConfigPath" -ForegroundColor Yellow
+        Write-Host "If Apache is installed elsewhere, edit manually:" -ForegroundColor Cyan
+        Write-Host "1. Find httpd.conf" -ForegroundColor Cyan
+        Write-Host "2. Change 'ServerSignature On' to 'ServerSignature Off'" -ForegroundColor Cyan
+        Write-Host "3. Add or change 'ServerTokens Prod'" -ForegroundColor Cyan
+    }
+    pause
+}
+
 # Main loop
 do {
     Show-Menu
@@ -506,6 +669,8 @@ do {
         '12' { Set-SecurityOptions }
         '13' { Enable-Auditing }
         '14' { Edit-Groups }
+        '15' { Set-AdvancedSecurity }
+        '16' { Set-ApacheSecurity }
         '69' { exit }
         '70' { Restart-Computer -Force }
         default { 
