@@ -95,10 +95,10 @@ function Set-UserProperties {
                 $wmiUser.PasswordRequired = $true
                 $wmiUser.Put() | Out-Null
                 
-                Write-Host "✓ Updated $($user.Name): Password expires enabled, user CAN change password" -ForegroundColor Green
+                Write-Host "Updated $($user.Name): Password expires enabled, user CAN change password" -ForegroundColor Green
             }
             catch {
-                Write-Host "✗ Error updating $($user.Name): $_" -ForegroundColor Red
+                Write-Host "Error updating $($user.Name): $_" -ForegroundColor Red
             }
         }
         
@@ -113,46 +113,7 @@ function Set-UserProperties {
     pause
 }
 
-# Function 2: Create user
-function New-LocalUserAccount {
-    do {
-        $answer = Read-Host "`nWould you like to create a user? [y/n]"
-        if ($answer -eq 'y') {
-            $username = Read-Host "What is the user you would like to create?"
-            try {
-                net user $username /add
-                Write-Host "$username has been added" -ForegroundColor Green
-            }
-            catch {
-                Write-Host "Error creating user: $_" -ForegroundColor Red
-            }
-        }
-    } while ($answer -eq 'y')
-}
-
-# Function 3: Disable user
-function Disable-LocalUserAccount {
-    do {
-        Clear-Host
-        Write-Host "`nCurrent Users:" -ForegroundColor Cyan
-        Get-LocalUser | Format-Table Name, Enabled, Description
-        
-        $answer = Read-Host "`nWould you like to disable a user? [y/n]"
-        if ($answer -eq 'y') {
-            $username = Read-Host "What is the name of the user?"
-            try {
-                Disable-LocalUser -Name $username
-                Write-Host "$username has been disabled" -ForegroundColor Green
-            }
-            catch {
-                Write-Host "Error disabling user: $_" -ForegroundColor Red
-            }
-        }
-    } while ($answer -eq 'y')
-    pause
-}
-
-# Function 4: Change all passwords
+# Function 2: Change all passwords
 function Set-AllPasswords {
     Write-Host "`nChanging all user passwords to '1qaz!QAZ2wsx@WSX'..." -ForegroundColor Yellow
     
@@ -172,7 +133,7 @@ function Set-AllPasswords {
     pause
 }
 
-# Function 5: Disable Guest and Administrator
+# Function 3: Disable Guest and Administrator
 function Disable-GuestAdmin {
     Write-Host "`nDisabling Guest and Administrator accounts..." -ForegroundColor Yellow
     try {
@@ -188,7 +149,7 @@ function Disable-GuestAdmin {
     pause
 }
 
-# Function 6: Set password policy
+# Function 4: Set password policy
 function Set-PasswordPolicy {
     Write-Host "`nConfiguring Password Policy..." -ForegroundColor Yellow
     
@@ -223,7 +184,7 @@ function Set-PasswordPolicy {
     pause
 }
 
-# Function 7: Set lockout policy
+# Function 5: Set lockout policy
 function Set-LockoutPolicy {
     Write-Host "`nConfiguring Account Lockout Policy..." -ForegroundColor Yellow
     
@@ -240,7 +201,7 @@ function Set-LockoutPolicy {
     pause
 }
 
-# Function 8: Enable Firewall
+# Function 6: Enable Firewall
 function Enable-WindowsFirewall {
     Write-Host "`nConfiguring Windows Defender Firewall..." -ForegroundColor Yellow
     
@@ -267,7 +228,7 @@ function Enable-WindowsFirewall {
     pause
 }
 
-# Function 9: Search for media files
+# Function 7: Search for media files
 function Search-MediaFiles {
     Write-Host "`nSearching for media files..." -ForegroundColor Yellow
     Write-Host "This may take a few minutes..." -ForegroundColor Cyan
@@ -305,7 +266,7 @@ function Search-MediaFiles {
     pause
 }
 
-# Function 10: Disable services
+# Function 8: Disable services
 function Disable-UnnecessaryServices {
     Write-Host "`nDisabling unnecessary services..." -ForegroundColor Yellow
     
@@ -348,7 +309,7 @@ function Disable-UnnecessaryServices {
     pause
 }
 
-# Function 11: Enable UAC
+# Function 9: Enable UAC
 function Enable-UAC {
     Write-Host "`nEnabling User Account Control (UAC)..." -ForegroundColor Yellow
     
@@ -362,7 +323,7 @@ function Enable-UAC {
     pause
 }
 
-# Function 12: Remote Desktop Config
+# Function 10: Remote Desktop Config
 function Set-RemoteDesktop {
     Write-Host "`nConfiguring Remote Desktop..." -ForegroundColor Yellow
     
@@ -380,7 +341,7 @@ function Set-RemoteDesktop {
     pause
 }
 
-# Function 13: Enable auto update
+# Function 11: Enable auto update
 function Enable-AutoUpdate {
     Write-Host "`nConfiguring Automatic Updates..." -ForegroundColor Yellow
     
@@ -401,7 +362,7 @@ function Enable-AutoUpdate {
     pause
 }
 
-# Function 14: Security options
+# Function 12: Security options
 function Set-SecurityOptions {
     Write-Host "`nChanging security options now..." -ForegroundColor Yellow
     
@@ -496,7 +457,7 @@ function Set-SecurityOptions {
     pause
 }
 
-# Function 15: Audit the machine
+# Function 13: Audit the machine
 function Enable-Auditing {
     Write-Host "`nAuditing the machine now..." -ForegroundColor Yellow
     
@@ -512,7 +473,7 @@ function Enable-Auditing {
     pause
 }
 
-# Function 16: Edit groups
+# Function 14: Edit groups
 function Edit-Groups {
     Write-Host "`nLocal Groups:" -ForegroundColor Cyan
     Get-LocalGroup | Format-Table Name, Description
@@ -523,7 +484,7 @@ function Edit-Groups {
     pause
 }
 
-# Function 17: Advanced Security Settings
+# Function 15: Advanced Security Settings
 function Set-AdvancedSecurity {
     Write-Host "`nConfiguring Advanced Security Settings..." -ForegroundColor Yellow
     
@@ -535,12 +496,12 @@ function Set-AdvancedSecurity {
             New-Item -Path $rdpPath -Force | Out-Null
         }
         Set-ItemProperty -Path $rdpPath -Name "fDenyTSConnections" -Value 1
-        Write-Host "✓ Remote Desktop Services disabled" -ForegroundColor Green
+        Write-Host "Remote Desktop Services disabled" -ForegroundColor Green
         
         # 2. Require CTRL+ALT+DEL at logon
         Write-Host "`n[2/4] Requiring CTRL+ALT+DEL at logon..." -ForegroundColor Cyan
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "DisableCAD" -Value 0
-        Write-Host "✓ CTRL+ALT+DEL requirement enabled" -ForegroundColor Green
+        Write-Host "CTRL+ALT+DEL requirement enabled" -ForegroundColor Green
         
         # 3. Disable WinRM unencrypted traffic
         Write-Host "`n[3/4] Disabling WinRM unencrypted traffic..." -ForegroundColor Cyan
@@ -549,14 +510,14 @@ function Set-AdvancedSecurity {
             New-Item -Path $winrmPath -Force | Out-Null
         }
         Set-ItemProperty -Path $winrmPath -Name "AllowUnencryptedTraffic" -Value 0
-        Write-Host "✓ WinRM unencrypted traffic disabled" -ForegroundColor Green
+        Write-Host "WinRM unencrypted traffic disabled" -ForegroundColor Green
         
         # 4. Enable digitally signed communications
         Write-Host "`n[4/4] Enabling digitally signed communications..." -ForegroundColor Cyan
         $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
         Set-ItemProperty -Path $lsaPath -Name "RequireSecuritySignature" -Value 1
         Set-ItemProperty -Path $lsaPath -Name "EnableSecuritySignature" -Value 1
-        Write-Host "✓ Digitally signed communications enabled" -ForegroundColor Green
+        Write-Host "Digitally signed communications enabled" -ForegroundColor Green
         
         Write-Host "`nAll advanced security settings configured successfully!" -ForegroundColor Green
     }
@@ -566,7 +527,7 @@ function Set-AdvancedSecurity {
     pause
 }
 
-# Function 18: Apache Security Configuration
+# Function 16: Apache Security Configuration
 function Set-ApacheSecurity {
     Write-Host "`nConfiguring Apache Security..." -ForegroundColor Yellow
     
@@ -585,7 +546,7 @@ function Set-ApacheSecurity {
                 if ($content[$i] -match "^\s*ServerSignature\s+On") {
                     $content[$i] = "ServerSignature Off"
                     $modified = $true
-                    Write-Host "✓ Changed 'ServerSignature On' to 'ServerSignature Off' on line $($i+1)" -ForegroundColor Green
+                    Write-Host "Changed 'ServerSignature On' to 'ServerSignature Off' on line $($i+1)" -ForegroundColor Green
                 }
             }
             
@@ -595,7 +556,7 @@ function Set-ApacheSecurity {
                 if ($content[$i] -match "^\s*ServerTokens") {
                     $content[$i] = "ServerTokens Prod"
                     $hasServerTokens = $true
-                    Write-Host "✓ Set 'ServerTokens Prod' on line $($i+1)" -ForegroundColor Green
+                    Write-Host "Set 'ServerTokens Prod' on line $($i+1)" -ForegroundColor Green
                 }
             }
             
@@ -605,7 +566,7 @@ function Set-ApacheSecurity {
                 for ($i = 0; $i -lt $content.Count; $i++) {
                     if ($content[$i] -match "^\s*ServerSignature") {
                         $content = $content[0..$i] + "ServerTokens Prod" + $content[($i+1)..($content.Count-1)]
-                        Write-Host "✓ Added 'ServerTokens Prod' directive" -ForegroundColor Green
+                        Write-Host "Added 'ServerTokens Prod' directive" -ForegroundColor Green
                         break
                     }
                 }
@@ -614,11 +575,11 @@ function Set-ApacheSecurity {
             if ($modified -or $hasServerTokens -or (-not $hasServerTokens)) {
                 # Backup original file
                 Copy-Item $apacheConfigPath "$apacheConfigPath.backup" -Force
-                Write-Host "✓ Backed up original config to httpd.conf.backup" -ForegroundColor Cyan
+                Write-Host "Backed up original config to httpd.conf.backup" -ForegroundColor Cyan
                 
                 # Save the modified content
                 $content | Set-Content $apacheConfigPath
-                Write-Host "✓ Apache configuration updated successfully!" -ForegroundColor Green
+                Write-Host "Apache configuration updated successfully!" -ForegroundColor Green
                 
                 # Offer to restart Apache service
                 $restart = Read-Host "`nRestart Apache service now? [y/n]"
@@ -626,9 +587,9 @@ function Set-ApacheSecurity {
                     $apacheService = Get-Service -Name "Apache*" -ErrorAction SilentlyContinue
                     if ($apacheService) {
                         Restart-Service $apacheService.Name
-                        Write-Host "✓ Apache service restarted" -ForegroundColor Green
+                        Write-Host "Apache service restarted" -ForegroundColor Green
                     } else {
-                        Write-Host "! Apache service not found - restart manually if needed" -ForegroundColor Yellow
+                        Write-Host "Apache service not found - restart manually if needed" -ForegroundColor Yellow
                     }
                 }
             } else {
@@ -671,11 +632,4 @@ do {
         '14' { Edit-Groups }
         '15' { Set-AdvancedSecurity }
         '16' { Set-ApacheSecurity }
-        '69' { exit }
-        '70' { Restart-Computer -Force }
-        default { 
-            Write-Host "Invalid option. Please try again." -ForegroundColor Red
-            Start-Sleep -Seconds 2
-        }
-    }
-} while ($true)
+        '
