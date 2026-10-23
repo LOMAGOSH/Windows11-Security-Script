@@ -13,6 +13,13 @@
     ALWAYS read the competition README first. Hardening can break required services.
 #>
 
+#Requires -Version 5.1
+
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    Write-Error 'This toolkit requires Windows. No changes were made.'
+    exit 1
+}
+
 # =====================================================================
 # SETTINGS - edit these to match the README / your preferences
 # =====================================================================
@@ -87,6 +94,7 @@ if ($PSVersionTable.PSEdition -eq 'Core' -or -not [Environment]::Is64BitProcess)
 $ErrorActionPreference = 'Continue'
 $script:Auto = $false
 $script:RegFail = 0
+$script:FailureCount = 0
 $script:CurrentUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]
 
 $desktop = [Environment]::GetFolderPath('Desktop')
@@ -103,7 +111,7 @@ Start-Sleep -Seconds 1
 function Write-Section { param([string]$Text) Write-Host "`n=== $Text ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Text) Write-Host $Text -ForegroundColor Green }
 function Write-Warn { param([string]$Text) Write-Host $Text -ForegroundColor Yellow }
-function Write-Bad  { param([string]$Text) Write-Host $Text -ForegroundColor Red }
+function Write-Bad  { param([string]$Text) $script:FailureCount++; Write-Host $Text -ForegroundColor Red }
 
 function Wait-Key {
     if (-not $script:Auto) { Read-Host "`nPress Enter to continue" | Out-Null }
@@ -117,16 +125,23 @@ function Confirm-Action {
     return ($a -match '^[yY]')
 }
 
-function Set-Reg {
-    param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
+# Use a full command name: the built-in R alias resolves to Invoke-History.
+function Set-RegistryValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory = $true, Position = 1)][ValidateNotNullOrEmpty()][string]$Name,
+        [Parameter(Mandatory = $true, Position = 2)][AllowNull()][AllowEmptyString()][AllowEmptyCollection()]$Value,
+        [Parameter(Position = 3)][ValidateSet('DWord', 'QWord', 'String', 'ExpandString', 'MultiString', 'Binary')][string]$Type = 'DWord'
+    )
     try {
-        if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+        if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
         if ($Type -eq 'MultiString') {
-            $k = $Path -replace '^HKLM:\\?', 'HKEY_LOCAL_MACHINE\'
+            $k = $Path -replace '^HKLM:\\?', 'HKEY_LOCAL_MACHINE\' -replace '^HKCU:\\?', 'HKEY_CURRENT_USER\'
             [Microsoft.Win32.Registry]::SetValue($k, $Name, [string[]]@($Value | Where-Object { $_ }), [Microsoft.Win32.RegistryValueKind]::MultiString)
         }
         else {
-            New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+            New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force -ErrorAction Stop | Out-Null
         }
     }
     catch {
@@ -134,7 +149,28 @@ function Set-Reg {
         Write-Bad "  [!] $Path\$Name -> $($_.Exception.Message)"
     }
 }
-function R { param($p, $n, $v, $t = 'DWord') Set-Reg -Path $p -Name $n -Value $v -Type $t }
+
+function Write-RegistryResult {
+    param([int]$Before, [string]$SuccessMessage)
+    $failed = $script:RegFail - $Before
+    if ($failed -gt 0) { Write-Bad "Incomplete: $failed registry write(s) failed in this step. See the errors above and the transcript." }
+    else { Write-Ok $SuccessMessage }
+}
+
+# Native programs do not throw on failure in Windows PowerShell 5.1.
+function Invoke-NativeCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$ArgumentList = @()
+    )
+    $output = & $FilePath @ArgumentList 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$FilePath failed (exit code $exitCode): $($output -join [Environment]::NewLine)"
+    }
+    $output
+}
 
 function Remove-RegValue {
     param([string]$Path, [string]$Name)
@@ -193,6 +229,7 @@ function Set-AllPasswords {
 # 3  Disable Guest / built-in Administrator
 # =====================================================================
 function Disable-GuestAdmin {
+    $regBefore = $script:RegFail
     Write-Section "3) Disable Guest and built-in Administrator"
     $guest = Get-LocalUser | Where-Object { $_.SID.Value -like '*-501' }
     $admin = Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' }
@@ -204,7 +241,8 @@ function Disable-GuestAdmin {
         else { Disable-LocalUser -Name $admin.Name -ErrorAction SilentlyContinue; Write-Ok "Built-in Administrator ($($admin.Name)) disabled." }
     }
     # CIS 2.3.1.x
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LimitBlankPasswordUse' 1
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LimitBlankPasswordUse' 1
+    Write-RegistryResult -Before $regBefore -SuccessMessage 'Blank-password restrictions applied.'
     Wait-Key
 }
 
@@ -212,12 +250,14 @@ function Disable-GuestAdmin {
 # 4  Password policy   (CIS 1.1)
 # =====================================================================
 function Set-PasswordPolicy {
+    $regBefore = $script:RegFail
     Write-Section "4) Password policy (CIS 1.1)"
+    $cfg = $null
     try {
-        net accounts /uniquepw:$PwHistory | Out-Null
-        net accounts /maxpwage:$PwMaxAge  | Out-Null
-        net accounts /minpwage:$PwMinAge  | Out-Null
-        net accounts /minpwlen:$PwMinLen  | Out-Null
+        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/uniquepw:$PwHistory") | Out-Null
+        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/maxpwage:$PwMaxAge") | Out-Null
+        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/minpwage:$PwMinAge") | Out-Null
+        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/minpwlen:$PwMinLen") | Out-Null
 
         $cfg = Join-Path $env:TEMP 'cp-pwpol.inf'
         $inf = @"
@@ -235,14 +275,13 @@ PasswordHistorySize = $PwHistory
 signature="`$CHICAGO`$"
 Revision=1
 "@
-        Set-Content -Path $cfg -Value $inf -Encoding Unicode
-        secedit /configure /db (Join-Path $env:TEMP 'cp-pwpol.sdb') /cfg $cfg /areas SECURITYPOLICY /quiet | Out-Null
-        Remove-Item $cfg -ErrorAction SilentlyContinue
-
-        R 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'NoLMHash' 1
-        Write-Ok "Password policy configured: history $PwHistory, max $PwMaxAge d, min $PwMinAge d, length $PwMinLen, complexity on, no reversible encryption."
+        Set-Content -Path $cfg -Value $inf -Encoding Unicode -ErrorAction Stop
+        Invoke-NativeCommand -FilePath secedit.exe -ArgumentList @('/configure', '/db', (Join-Path $env:TEMP 'cp-pwpol.sdb'), '/cfg', $cfg, '/areas', 'SECURITYPOLICY', '/quiet') | Out-Null
+        Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'NoLMHash' 1
+        Write-RegistryResult -Before $regBefore -SuccessMessage "Password policy configured: history $PwHistory, max $PwMaxAge d, min $PwMinAge d, length $PwMinLen, complexity on, no reversible encryption."
     }
     catch { Write-Bad "Error configuring password policy: $_" }
+    finally { if ($cfg) { Remove-Item -LiteralPath $cfg -ErrorAction SilentlyContinue } }
     Wait-Key
 }
 
@@ -252,9 +291,9 @@ Revision=1
 function Set-LockoutPolicy {
     Write-Section "5) Account lockout policy (CIS 1.2)"
     try {
-        net accounts /lockoutthreshold:$LockThreshold | Out-Null
-        net accounts /lockoutduration:$LockDuration   | Out-Null
-        net accounts /lockoutwindow:$LockWindow       | Out-Null
+        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/lockoutthreshold:$LockThreshold") | Out-Null
+        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/lockoutduration:$LockDuration") | Out-Null
+        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/lockoutwindow:$LockWindow") | Out-Null
         Write-Ok "Lockout: $LockThreshold attempts, $LockDuration min duration, $LockWindow min reset window."
     }
     catch { Write-Bad "Error configuring lockout policy: $_" }
@@ -367,19 +406,20 @@ function Disable-UnnecessaryServices {
 # 9  UAC   (CIS 2.3.17)
 # =====================================================================
 function Enable-UAC {
+    $regBefore = $script:RegFail
     Write-Section "9) User Account Control (CIS 2.3.17)"
     $S = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-    R $S 'EnableLUA' 1
-    R $S 'FilterAdministratorToken' 1
-    R $S 'ConsentPromptBehaviorAdmin' 2
-    R $S 'ConsentPromptBehaviorUser' 0
-    R $S 'EnableInstallerDetection' 1
-    R $S 'EnableSecureUIAPaths' 1
-    R $S 'PromptOnSecureDesktop' 1
-    R $S 'EnableVirtualization' 1
-    R $S 'ValidateAdminCodeSignatures' 0
-    R $S 'LocalAccountTokenFilterPolicy' 0
-    Write-Ok "UAC configured (a reboot is required for EnableLUA changes)."
+    Set-RegistryValue $S 'EnableLUA' 1
+    Set-RegistryValue $S 'FilterAdministratorToken' 1
+    Set-RegistryValue $S 'ConsentPromptBehaviorAdmin' 2
+    Set-RegistryValue $S 'ConsentPromptBehaviorUser' 0
+    Set-RegistryValue $S 'EnableInstallerDetection' 1
+    Set-RegistryValue $S 'EnableSecureUIAPaths' 1
+    Set-RegistryValue $S 'PromptOnSecureDesktop' 1
+    Set-RegistryValue $S 'EnableVirtualization' 1
+    Set-RegistryValue $S 'ValidateAdminCodeSignatures' 0
+    Set-RegistryValue $S 'LocalAccountTokenFilterPolicy' 0
+    Write-RegistryResult -Before $regBefore -SuccessMessage "UAC configured (a reboot is required for EnableLUA changes)."
     Wait-Key
 }
 
@@ -387,36 +427,39 @@ function Enable-UAC {
 # 10  Remote Desktop
 # =====================================================================
 function Set-RemoteDesktop {
+    $regBefore = $script:RegFail
     Write-Section "10) Remote Desktop configuration"
     $TS = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
     $TSP = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
     $a = Read-Host "[D]isable Remote Desktop, [H]arden it but keep it ON (README requires RDP), or [S]kip? (D/H/S)"
     if ($a -match '^[dD]') {
-        R $TS 'fDenyTSConnections' 1
-        R $TSP 'fDenyTSConnections' 1
+        Set-RegistryValue $TS 'fDenyTSConnections' 1
+        Set-RegistryValue $TSP 'fDenyTSConnections' 1
         Disable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-        Write-Ok "Remote Desktop disabled."
+        Write-Host "Remote Desktop disable settings requested."
     }
     elseif ($a -match '^[hH]') {
-        R $TS 'fDenyTSConnections' 0
-        R "$TS\WinStations\RDP-Tcp" 'UserAuthentication' 1      # NLA
-        R "$TS\WinStations\RDP-Tcp" 'SecurityLayer' 2
-        R "$TS\WinStations\RDP-Tcp" 'MinEncryptionLevel' 3
-        R $TSP 'fDenyTSConnections' 0
-        R $TSP 'UserAuthentication' 1
-        R $TSP 'SecurityLayer' 2
-        R $TSP 'MinEncryptionLevel' 3
-        R $TSP 'DisablePasswordSaving' 1
-        R $TSP 'fDisableCdm' 1
-        R $TSP 'fPromptForPassword' 1
-        R $TSP 'fEncryptRPCTraffic' 1
+        Set-RegistryValue $TS 'fDenyTSConnections' 0
+        Set-RegistryValue "$TS\WinStations\RDP-Tcp" 'UserAuthentication' 1      # NLA
+        Set-RegistryValue "$TS\WinStations\RDP-Tcp" 'SecurityLayer' 2
+        Set-RegistryValue "$TS\WinStations\RDP-Tcp" 'MinEncryptionLevel' 3
+        Set-RegistryValue $TSP 'fDenyTSConnections' 0
+        Set-RegistryValue $TSP 'UserAuthentication' 1
+        Set-RegistryValue $TSP 'SecurityLayer' 2
+        Set-RegistryValue $TSP 'MinEncryptionLevel' 3
+        Set-RegistryValue $TSP 'DisablePasswordSaving' 1
+        Set-RegistryValue $TSP 'fDisableCdm' 1
+        Set-RegistryValue $TSP 'fPromptForPassword' 1
+        Set-RegistryValue $TSP 'fEncryptRPCTraffic' 1
         Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-        Write-Ok "Remote Desktop kept ON with NLA, high encryption, no password saving, drive redirection off."
+        Write-Host "Remote Desktop hardening settings requested: NLA, high encryption, no password saving, drive redirection off."
     }
+    else { Write-Warn 'Remote Desktop configuration skipped.'; Wait-Key; return }
     # Remote Assistance off either way (CIS 18.8.36)
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowUnsolicited' 0
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowToGetHelp' 0
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowUnsolicited' 0
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowToGetHelp' 0
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0
+    Write-RegistryResult -Before $regBefore -SuccessMessage 'Remote Desktop and Remote Assistance registry settings applied.'
     Wait-Key
 }
 
@@ -424,21 +467,22 @@ function Set-RemoteDesktop {
 # 11  Automatic updates configuration
 # =====================================================================
 function Enable-AutoUpdate {
+    $regBefore = $script:RegFail
     Write-Section "11) Configure automatic updates"
     $AU = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
-    R $AU 'NoAutoUpdate' 0
-    R $AU 'AUOptions' 4
-    R $AU 'ScheduledInstallDay' 0
-    R $AU 'ScheduledInstallTime' 3
-    R $AU 'NoAutoRebootWithLoggedOnUsers' 0
-    R 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update' 'AUOptions' 4
-    R 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'AllowMUUpdateService' 1    # other Microsoft products
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'ManagePreviewBuildsPolicyValue' 1
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'BranchReadinessLevel' 16
+    Set-RegistryValue $AU 'NoAutoUpdate' 0
+    Set-RegistryValue $AU 'AUOptions' 4
+    Set-RegistryValue $AU 'ScheduledInstallDay' 0
+    Set-RegistryValue $AU 'ScheduledInstallTime' 3
+    Set-RegistryValue $AU 'NoAutoRebootWithLoggedOnUsers' 0
+    Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update' 'AUOptions' 4
+    Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'AllowMUUpdateService' 1    # other Microsoft products
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'ManagePreviewBuildsPolicyValue' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'BranchReadinessLevel' 16
     foreach ($n in 'wuauserv', 'bits', 'cryptsvc', 'UsoSvc') {
         try { Set-Service -Name $n -StartupType Automatic -ErrorAction Stop; Start-Service -Name $n -ErrorAction SilentlyContinue } catch {}
     }
-    Write-Ok "Automatic updates enabled (download + install automatically, Microsoft Update included)."
+    Write-RegistryResult -Before $regBefore -SuccessMessage "Automatic updates enabled (download + install automatically, Microsoft Update included)."
     Wait-Key
 }
 
@@ -446,6 +490,7 @@ function Enable-AutoUpdate {
 # 12  Security options   (CIS 2.3)
 # =====================================================================
 function Set-SecurityOptions {
+    $regBefore = $script:RegFail
     Write-Section "12) Local security options (CIS 2.3)"
     $S = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
     $L = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
@@ -458,83 +503,83 @@ function Set-SecurityOptions {
     if ([string]::IsNullOrWhiteSpace($subject)) { $subject = 'Authorized Use Only' }
 
     # Accounts
-    R $S 'NoConnectedUser' 3                         # block Microsoft accounts
-    R $L 'LimitBlankPasswordUse' 1
-    R $L 'ForceGuest' 0                              # classic local account sharing
+    Set-RegistryValue $S 'NoConnectedUser' 3                         # block Microsoft accounts
+    Set-RegistryValue $L 'LimitBlankPasswordUse' 1
+    Set-RegistryValue $L 'ForceGuest' 0                              # classic local account sharing
     # Audit
-    R $L 'SCENoApplyLegacyAuditPolicy' 1
-    R $L 'CrashOnAuditFail' 0
-    R $L 'auditbaseobjects' 0
-    R $L 'fullprivilegeauditing' ([byte[]]@(0)) 'Binary'
+    Set-RegistryValue $L 'SCENoApplyLegacyAuditPolicy' 1
+    Set-RegistryValue $L 'CrashOnAuditFail' 0
+    Set-RegistryValue $L 'auditbaseobjects' 0
+    Set-RegistryValue $L 'fullprivilegeauditing' ([byte[]]@(0)) 'Binary'
     # Devices
-    R $W 'AllocateDASD' '0' 'String'
-    R $W 'AllocateCDRoms' '1' 'String'
-    R $W 'AllocateFloppies' '1' 'String'
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Providers\LanMan Print Services\Servers' 'AddPrinterDrivers' 1
+    Set-RegistryValue $W 'AllocateDASD' '0' 'String'
+    Set-RegistryValue $W 'AllocateCDRoms' '1' 'String'
+    Set-RegistryValue $W 'AllocateFloppies' '1' 'String'
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Providers\LanMan Print Services\Servers' 'AddPrinterDrivers' 1
     # Domain member / Netlogon
     $N = "$V\Netlogon\Parameters"
-    R $N 'RequireSignOrSeal' 1
-    R $N 'SealSecureChannel' 1
-    R $N 'SignSecureChannel' 1
-    R $N 'DisablePasswordChange' 0
-    R $N 'MaximumPasswordAge' 30
-    R $N 'RequireStrongKey' 1
+    Set-RegistryValue $N 'RequireSignOrSeal' 1
+    Set-RegistryValue $N 'SealSecureChannel' 1
+    Set-RegistryValue $N 'SignSecureChannel' 1
+    Set-RegistryValue $N 'DisablePasswordChange' 0
+    Set-RegistryValue $N 'MaximumPasswordAge' 30
+    Set-RegistryValue $N 'RequireStrongKey' 1
     # Interactive logon
-    R $S 'DisableCAD' 0
-    R $S 'DontDisplayLastUserName' 1
-    R $S 'InactivityTimeoutSecs' 900
-    R $S 'legalnoticetext' $body 'String'
-    R $S 'legalnoticecaption' $subject 'String'
-    R $S 'undockwithoutlogon' 0
-    R $S 'ShutdownWithoutLogon' 0
-    R $W 'CachedLogonsCount' '4' 'String'
-    R $W 'PasswordExpiryWarning' 14
-    R $W 'ScRemoveOption' '1' 'String'
-    R $W 'AutoAdminLogon' '0' 'String'
+    Set-RegistryValue $S 'DisableCAD' 0
+    Set-RegistryValue $S 'DontDisplayLastUserName' 1
+    Set-RegistryValue $S 'InactivityTimeoutSecs' 900
+    Set-RegistryValue $S 'legalnoticetext' $body 'String'
+    Set-RegistryValue $S 'legalnoticecaption' $subject 'String'
+    Set-RegistryValue $S 'undockwithoutlogon' 0
+    Set-RegistryValue $S 'ShutdownWithoutLogon' 0
+    Set-RegistryValue $W 'CachedLogonsCount' '4' 'String'
+    Set-RegistryValue $W 'PasswordExpiryWarning' 14
+    Set-RegistryValue $W 'ScRemoveOption' '1' 'String'
+    Set-RegistryValue $W 'AutoAdminLogon' '0' 'String'
     # Microsoft network client / server
-    R "$V\LanmanWorkstation\Parameters" 'RequireSecuritySignature' 1
-    R "$V\LanmanWorkstation\Parameters" 'EnableSecuritySignature' 1
-    R "$V\LanmanWorkstation\Parameters" 'EnablePlainTextPassword' 0
-    R "$V\LanmanServer\Parameters" 'RequireSecuritySignature' 1
-    R "$V\LanmanServer\Parameters" 'EnableSecuritySignature' 1
-    R "$V\LanmanServer\Parameters" 'autodisconnect' 15
-    R "$V\LanmanServer\Parameters" 'enableforcedlogoff' 1
-    R "$V\LanmanServer\Parameters" 'SMBServerNameHardeningLevel' 1
+    Set-RegistryValue "$V\LanmanWorkstation\Parameters" 'RequireSecuritySignature' 1
+    Set-RegistryValue "$V\LanmanWorkstation\Parameters" 'EnableSecuritySignature' 1
+    Set-RegistryValue "$V\LanmanWorkstation\Parameters" 'EnablePlainTextPassword' 0
+    Set-RegistryValue "$V\LanmanServer\Parameters" 'RequireSecuritySignature' 1
+    Set-RegistryValue "$V\LanmanServer\Parameters" 'EnableSecuritySignature' 1
+    Set-RegistryValue "$V\LanmanServer\Parameters" 'autodisconnect' 15
+    Set-RegistryValue "$V\LanmanServer\Parameters" 'enableforcedlogoff' 1
+    Set-RegistryValue "$V\LanmanServer\Parameters" 'SMBServerNameHardeningLevel' 1
     # Network access
-    R $L 'RestrictAnonymousSAM' 1
-    R $L 'RestrictAnonymous' 1
-    R $L 'DisableDomainCreds' 1
-    R $L 'EveryoneIncludesAnonymous' 0
-    R $L 'RestrictRemoteSAM' 'O:BAG:BAD:(A;;RC;;;BA)' 'String'
-    R "$V\LanmanServer\Parameters" 'NullSessionPipes' @() 'MultiString'
-    R "$V\LanmanServer\Parameters" 'NullSessionShares' @() 'MultiString'
-    R "$V\LanmanServer\Parameters" 'RestrictNullSessAccess' 1
+    Set-RegistryValue $L 'RestrictAnonymousSAM' 1
+    Set-RegistryValue $L 'RestrictAnonymous' 1
+    Set-RegistryValue $L 'DisableDomainCreds' 1
+    Set-RegistryValue $L 'EveryoneIncludesAnonymous' 0
+    Set-RegistryValue $L 'RestrictRemoteSAM' 'O:BAG:BAD:(A;;RC;;;BA)' 'String'
+    Set-RegistryValue "$V\LanmanServer\Parameters" 'NullSessionPipes' @() 'MultiString'
+    Set-RegistryValue "$V\LanmanServer\Parameters" 'NullSessionShares' @() 'MultiString'
+    Set-RegistryValue "$V\LanmanServer\Parameters" 'RestrictNullSessAccess' 1
     # Network security
-    R $L 'UseMachineId' 1
-    R "$L\MSV1_0" 'AllowNullSessionFallback' 0
-    R "$L\pku2u" 'AllowOnlineID' 0
-    R "$V\Kerberos\Parameters" 'SupportedEncryptionTypes' 2147483640
-    R $L 'LmCompatibilityLevel' 5
-    R $L 'NoLMHash' 1
-    R "$V\LDAP" 'LDAPClientIntegrity' 1
-    R "$L\MSV1_0" 'NTLMMinClientSec' 537395200
-    R "$L\MSV1_0" 'NTLMMinServerSec' 537395200
+    Set-RegistryValue $L 'UseMachineId' 1
+    Set-RegistryValue "$L\MSV1_0" 'AllowNullSessionFallback' 0
+    Set-RegistryValue "$L\pku2u" 'AllowOnlineID' 0
+    Set-RegistryValue "$V\Kerberos\Parameters" 'SupportedEncryptionTypes' 2147483640
+    Set-RegistryValue $L 'LmCompatibilityLevel' 5
+    Set-RegistryValue $L 'NoLMHash' 1
+    Set-RegistryValue "$V\LDAP" 'LDAPClientIntegrity' 1
+    Set-RegistryValue "$L\MSV1_0" 'NTLMMinClientSec' 537395200
+    Set-RegistryValue "$L\MSV1_0" 'NTLMMinServerSec' 537395200
     # Shutdown / system objects
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'ClearPageFileAtShutdown' 1
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Kernel' 'ObCaseInsensitive' 1
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'ProtectionMode' 1
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'SafeDllSearchMode' 1
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'ClearPageFileAtShutdown' 1
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Kernel' 'ObCaseInsensitive' 1
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'ProtectionMode' 1
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'SafeDllSearchMode' 1
     # UAC (also covered in option 9)
-    R $S 'EnableLUA' 1
-    R $S 'FilterAdministratorToken' 1
-    R $S 'ConsentPromptBehaviorAdmin' 2
-    R $S 'ConsentPromptBehaviorUser' 0
-    R $S 'PromptOnSecureDesktop' 1
-    R $S 'EnableInstallerDetection' 1
+    Set-RegistryValue $S 'EnableLUA' 1
+    Set-RegistryValue $S 'FilterAdministratorToken' 1
+    Set-RegistryValue $S 'ConsentPromptBehaviorAdmin' 2
+    Set-RegistryValue $S 'ConsentPromptBehaviorUser' 0
+    Set-RegistryValue $S 'PromptOnSecureDesktop' 1
+    Set-RegistryValue $S 'EnableInstallerDetection' 1
     # DEP
-    try { bcdedit.exe /set '{current}' nx AlwaysOn | Out-Null } catch {}
+    try { Invoke-NativeCommand -FilePath bcdedit.exe -ArgumentList @('/set', '{current}', 'nx', 'AlwaysOn') | Out-Null } catch { Write-Bad "DEP was not configured: $($_.Exception.Message)" }
 
-    if ($script:RegFail -eq 0) { Write-Ok "Security options configured." } else { Write-Warn "Done with $($script:RegFail) registry write error(s) - see messages above." }
+    Write-RegistryResult -Before $regBefore -SuccessMessage "Security-option registry settings applied. Review any separate DEP error above."
     Wait-Key
 }
 
@@ -542,12 +587,13 @@ function Set-SecurityOptions {
 # 13  Audit policy   (CIS 17)
 # =====================================================================
 function Enable-Auditing {
+    $regBefore = $script:RegFail
     Write-Section "13) Advanced audit policy (CIS 17)"
     try {
-        R 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1
-        auditpol /set /category:* /success:enable /failure:enable | Out-Null
-        R 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' 'ProcessCreationIncludeCmdLine_Enabled' 1
-        Write-Ok "Success+Failure auditing enabled for every audit category (superset of the CIS audit list)."
+        Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1
+        Invoke-NativeCommand -FilePath auditpol.exe -ArgumentList @('/set', '/category:*', '/success:enable', '/failure:enable') | Out-Null
+        Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' 'ProcessCreationIncludeCmdLine_Enabled' 1
+        Write-RegistryResult -Before $regBefore -SuccessMessage "Success+Failure auditing enabled for every audit category (superset of the CIS audit list)."
     }
     catch { Write-Bad "Error enabling auditing: $_" }
     Wait-Key
@@ -563,7 +609,7 @@ function Edit-Groups {
         Write-Section "14) Users & groups manager"
         Write-Host "1) List users and administrators      2) Disable users NOT on an authorized list"
         Write-Host "3) Fix Administrators group           4) Create user"
-        Write-Host "5) Disable user                        6) Disable user"
+        Write-Host "5) Disable user (confirm)             6) Disable user (confirm)"
         Write-Host "7) Add user to group                  8) Remove user from group"
         Write-Host "0) Back"
         $c = Read-Host "`nChoice"
@@ -616,7 +662,7 @@ function Edit-Groups {
             }
             '6' {
                 $n = Read-Host "Username to disable"
-                if ($n) { try { Disable-LocalUser -Name $n -ErrorAction Stop; Write-Ok "Disabled" } catch { Write-Bad "Failed: $_" } }
+                if ($n -and (Confirm-Action "Disable account '$n'?" $false)) { try { Disable-LocalUser -Name $n -ErrorAction Stop; Write-Ok "Disabled" } catch { Write-Bad "Failed: $_" } }
                 Wait-Key
             }
             '7' {
@@ -637,6 +683,7 @@ function Edit-Groups {
 # 15  Advanced security   (CIS 18 - Administrative Templates)
 # =====================================================================
 function Set-AdvancedSecurity {
+    $regBefore = $script:RegFail
     Write-Section "15) Advanced security - CIS 18 administrative templates"
     $POL = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows'
     $WNT = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT'
@@ -647,153 +694,153 @@ function Set-AdvancedSecurity {
     $TCP6 = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'
 
     # --- Lock screen / personalization / input
-    R "$POL\Personalization" 'NoLockScreenCamera' 1
-    R "$POL\Personalization" 'NoLockScreenSlideshow' 1
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
+    Set-RegistryValue "$POL\Personalization" 'NoLockScreenCamera' 1
+    Set-RegistryValue "$POL\Personalization" 'NoLockScreenSlideshow' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
 
     # --- MS Security Guide / MSS
-    R 'HKLM:\SYSTEM\CurrentControlSet\Services\mrxsmb10' 'Start' 4
-    R 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1' 0
-    R "$SM\kernel" 'DisableExceptionChainValidation' 0
-    R 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters' 'NodeType' 2
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' 'UseLogonCredential' 0
-    R 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters' 'NoNameReleaseOnDemand' 1
-    R $TCP 'DisableIPSourceRouting' 2
-    R $TCP6 'DisableIPSourceRouting' 2
-    R $TCP 'EnableICMPRedirect' 0
-    R $TCP 'PerformRouterDiscovery' 0
-    R $TCP 'TcpMaxDataRetransmissions' 3
-    R $TCP6 'TcpMaxDataRetransmissions' 3
-    R 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'ScreenSaverGracePeriod' '5' 'String'
-    R 'HKLM:\SYSTEM\CurrentControlSet\Services\Eventlog\Security' 'WarningLevel' 90
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Services\mrxsmb10' 'Start' 4
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1' 0
+    Set-RegistryValue "$SM\kernel" 'DisableExceptionChainValidation' 0
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters' 'NodeType' 2
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' 'UseLogonCredential' 0
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters' 'NoNameReleaseOnDemand' 1
+    Set-RegistryValue $TCP 'DisableIPSourceRouting' 2
+    Set-RegistryValue $TCP6 'DisableIPSourceRouting' 2
+    Set-RegistryValue $TCP 'EnableICMPRedirect' 0
+    Set-RegistryValue $TCP 'PerformRouterDiscovery' 0
+    Set-RegistryValue $TCP 'TcpMaxDataRetransmissions' 3
+    Set-RegistryValue $TCP6 'TcpMaxDataRetransmissions' 3
+    Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'ScreenSaverGracePeriod' '5' 'String'
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Eventlog\Security' 'WarningLevel' 90
 
     # --- Network
-    R "$WNT\DNSClient" 'EnableMulticast' 0
-    R 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'EnableMDNS' 0
-    R "$POL\LanmanWorkstation" 'AllowInsecureGuestAuth' 0
-    R "$POL\Network Connections" 'NC_ShowSharedAccessUI' 0
-    R "$POL\Network Connections" 'NC_StdDomainUserSetLocation' 1
-    R "$POL\NetworkProvider\HardenedPaths" '\\*\NETLOGON' 'RequireMutualAuthentication=1,RequireIntegrity=1' 'String'
-    R "$POL\NetworkProvider\HardenedPaths" '\\*\SYSVOL' 'RequireMutualAuthentication=1,RequireIntegrity=1' 'String'
-    R "$POL\WCN\UI" 'DisableWcnUi' 1
-    R "$POL\WCN\Registrars" 'EnableRegistrars' 0
-    R "$POL\WcmSvc\GroupPolicy" 'fMinimizeConnections' 1
-    R "$POL\WcmSvc\GroupPolicy" 'fBlockNonDomain' 1
-    R 'HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config' 'AutoConnectAllowedOEM' 0
+    Set-RegistryValue "$WNT\DNSClient" 'EnableMulticast' 0
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'EnableMDNS' 0
+    Set-RegistryValue "$POL\LanmanWorkstation" 'AllowInsecureGuestAuth' 0
+    Set-RegistryValue "$POL\Network Connections" 'NC_ShowSharedAccessUI' 0
+    Set-RegistryValue "$POL\Network Connections" 'NC_StdDomainUserSetLocation' 1
+    Set-RegistryValue "$POL\NetworkProvider\HardenedPaths" '\\*\NETLOGON' 'RequireMutualAuthentication=1,RequireIntegrity=1' 'String'
+    Set-RegistryValue "$POL\NetworkProvider\HardenedPaths" '\\*\SYSVOL' 'RequireMutualAuthentication=1,RequireIntegrity=1' 'String'
+    Set-RegistryValue "$POL\WCN\UI" 'DisableWcnUi' 1
+    Set-RegistryValue "$POL\WCN\Registrars" 'EnableRegistrars' 0
+    Set-RegistryValue "$POL\WcmSvc\GroupPolicy" 'fMinimizeConnections' 1
+    Set-RegistryValue "$POL\WcmSvc\GroupPolicy" 'fBlockNonDomain' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config' 'AutoConnectAllowedOEM' 0
 
     # --- Printers
-    R "$WNT\Printers" 'RegisterSpoolerRemoteRpcEndPoint' 2
-    R "$WNT\Printers" 'DisableWebPnPDownload' 1
-    R "$WNT\Printers" 'DisableHTTPPrinting' 1
-    R "$WNT\Printers" 'CopyFilesPolicy' 1
-    R "$WNT\Printers" 'RedirectionguardPolicy' 1
-    R "$WNT\Printers\RPC" 'RpcUseNamedPipeProtocol' 1
-    R "$WNT\Printers\PointAndPrint" 'RestrictDriverInstallationToAdministrators' 1
-    R "$WNT\Printers\PointAndPrint" 'NoWarningNoElevationOnInstall' 0
-    R "$WNT\Printers\PointAndPrint" 'UpdatePromptSettings' 0
+    Set-RegistryValue "$WNT\Printers" 'RegisterSpoolerRemoteRpcEndPoint' 2
+    Set-RegistryValue "$WNT\Printers" 'DisableWebPnPDownload' 1
+    Set-RegistryValue "$WNT\Printers" 'DisableHTTPPrinting' 1
+    Set-RegistryValue "$WNT\Printers" 'CopyFilesPolicy' 1
+    Set-RegistryValue "$WNT\Printers" 'RedirectionguardPolicy' 1
+    Set-RegistryValue "$WNT\Printers\RPC" 'RpcUseNamedPipeProtocol' 1
+    Set-RegistryValue "$WNT\Printers\PointAndPrint" 'RestrictDriverInstallationToAdministrators' 1
+    Set-RegistryValue "$WNT\Printers\PointAndPrint" 'NoWarningNoElevationOnInstall' 0
+    Set-RegistryValue "$WNT\Printers\PointAndPrint" 'UpdatePromptSettings' 0
 
     # --- System / logon / credentials
-    R "$PSYS\Audit" 'ProcessCreationIncludeCmdLine_Enabled' 1
-    R "$PSYS\CredSSP\Parameters" 'AllowEncryptionOracle' 0
-    R "$POL\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1
-    R 'HKLM:\SYSTEM\CurrentControlSet\Policies\EarlyLaunch' 'DriverLoadPolicy' 3
-    R "$POL\System" 'BlockUserFromShowingAccountDetailsOnSignin' 1
-    R "$POL\System" 'DontDisplayNetworkSelectionUI' 1
-    R "$POL\System" 'DontEnumerateConnectedUsers' 1
-    R "$POL\System" 'EnumerateLocalUsers' 0
-    R "$POL\System" 'DisableLockScreenAppNotifications' 1
-    R "$POL\System" 'AllowDomainPINLogon' 0
-    R "$POL\System" 'AllowCrossDeviceClipboard' 0
-    R "$POL\System" 'UploadUserActivities' 0
-    R "$POL\System" 'EnableSmartScreen' 1
-    R "$POL\System" 'ShellSmartScreenLevel' 'Block' 'String'
-    R $PSYS 'DisableAutomaticRestartSignOn' 1
-    R $PSYS 'MSAOptional' 1
-    R $PSYS 'NoLocalPasswordResetQuestions' 1
-    R 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL' 1
-    R "$POL\CredUI" 'DisablePasswordReveal' 1
-    R "$POL\CredUI" 'EnumerateAdministrators' 0
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51' 'ACSettingIndex' 1
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51' 'DCSettingIndex' 1
-    R "$WNT\Rpc" 'EnableAuthEpResolution' 1
-    R "$WNT\Rpc" 'RestrictRemoteClients' 1
+    Set-RegistryValue "$PSYS\Audit" 'ProcessCreationIncludeCmdLine_Enabled' 1
+    Set-RegistryValue "$PSYS\CredSSP\Parameters" 'AllowEncryptionOracle' 0
+    Set-RegistryValue "$POL\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Policies\EarlyLaunch' 'DriverLoadPolicy' 3
+    Set-RegistryValue "$POL\System" 'BlockUserFromShowingAccountDetailsOnSignin' 1
+    Set-RegistryValue "$POL\System" 'DontDisplayNetworkSelectionUI' 1
+    Set-RegistryValue "$POL\System" 'DontEnumerateConnectedUsers' 1
+    Set-RegistryValue "$POL\System" 'EnumerateLocalUsers' 0
+    Set-RegistryValue "$POL\System" 'DisableLockScreenAppNotifications' 1
+    Set-RegistryValue "$POL\System" 'AllowDomainPINLogon' 0
+    Set-RegistryValue "$POL\System" 'AllowCrossDeviceClipboard' 0
+    Set-RegistryValue "$POL\System" 'UploadUserActivities' 0
+    Set-RegistryValue "$POL\System" 'EnableSmartScreen' 1
+    Set-RegistryValue "$POL\System" 'ShellSmartScreenLevel' 'Block' 'String'
+    Set-RegistryValue $PSYS 'DisableAutomaticRestartSignOn' 1
+    Set-RegistryValue $PSYS 'MSAOptional' 1
+    Set-RegistryValue $PSYS 'NoLocalPasswordResetQuestions' 1
+    Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL' 1
+    Set-RegistryValue "$POL\CredUI" 'DisablePasswordReveal' 1
+    Set-RegistryValue "$POL\CredUI" 'EnumerateAdministrators' 0
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51' 'ACSettingIndex' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51' 'DCSettingIndex' 1
+    Set-RegistryValue "$WNT\Rpc" 'EnableAuthEpResolution' 1
+    Set-RegistryValue "$WNT\Rpc" 'RestrictRemoteClients' 1
 
     # --- Internet communication / telemetry
-    R "$POL\TabletPC" 'PreventHandwritingDataSharing' 1
-    R "$POL\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
-    R "$POL\Registration Wizard Control" 'NoRegistration' 1
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Internet Connection Wizard' 'ExitOnMSICW' 1
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\SearchCompanion' 'DisableContentFileUpdates' 1
-    R "$PEXP" 'NoWebServices' 1
-    R "$PEXP" 'NoOnlinePrintsWizard' 1
-    R "$PEXP" 'NoPublishingWizard' 1
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable' 0
-    R "$POL\Windows Error Reporting" 'Disabled' 1
-    R 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' 'Disabled' 1
-    R "$POL\DataCollection" 'AllowTelemetry' 1
-    R "$POL\DataCollection" 'DisableEnterpriseAuthProxy' 1
-    R "$POL\DataCollection" 'DisableOneSettingsDownloads' 1
-    R "$POL\DataCollection" 'DoNotShowFeedbackNotifications' 1
-    R "$POL\DataCollection" 'EnableOneSettingsAuditing' 1
-    R "$POL\DataCollection" 'LimitDiagnosticLogCollection' 1
-    R "$POL\DataCollection" 'LimitDumpCollection' 1
-    R "$POL\DataCollection" 'AllowDeviceNameInTelemetry' 0
-    R "$POL\DeliveryOptimization" 'DODownloadMode' 0
+    Set-RegistryValue "$POL\TabletPC" 'PreventHandwritingDataSharing' 1
+    Set-RegistryValue "$POL\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
+    Set-RegistryValue "$POL\Registration Wizard Control" 'NoRegistration' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Internet Connection Wizard' 'ExitOnMSICW' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\SearchCompanion' 'DisableContentFileUpdates' 1
+    Set-RegistryValue "$PEXP" 'NoWebServices' 1
+    Set-RegistryValue "$PEXP" 'NoOnlinePrintsWizard' 1
+    Set-RegistryValue "$PEXP" 'NoPublishingWizard' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable' 0
+    Set-RegistryValue "$POL\Windows Error Reporting" 'Disabled' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' 'Disabled' 1
+    Set-RegistryValue "$POL\DataCollection" 'AllowTelemetry' 1
+    Set-RegistryValue "$POL\DataCollection" 'DisableEnterpriseAuthProxy' 1
+    Set-RegistryValue "$POL\DataCollection" 'DisableOneSettingsDownloads' 1
+    Set-RegistryValue "$POL\DataCollection" 'DoNotShowFeedbackNotifications' 1
+    Set-RegistryValue "$POL\DataCollection" 'EnableOneSettingsAuditing' 1
+    Set-RegistryValue "$POL\DataCollection" 'LimitDiagnosticLogCollection' 1
+    Set-RegistryValue "$POL\DataCollection" 'LimitDumpCollection' 1
+    Set-RegistryValue "$POL\DataCollection" 'AllowDeviceNameInTelemetry' 0
+    Set-RegistryValue "$POL\DeliveryOptimization" 'DODownloadMode' 0
 
     # --- App privacy / runtime / cloud content / consumer features
-    R "$POL\AppPrivacy" 'LetAppsActivateWithVoiceAboveLock' 2
-    R "$POL\CloudContent" 'DisableWindowsConsumerFeatures' 1
-    R "$POL\CloudContent" 'DisableCloudOptimizedContent' 1
-    R "$POL\Connect" 'RequirePinForPairing' 1
-    R "$POL\MicrosoftAccount" 'DisableUserAuth' 1
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures' 'EnhancedAntiSpoofing' 1
+    Set-RegistryValue "$POL\AppPrivacy" 'LetAppsActivateWithVoiceAboveLock' 2
+    Set-RegistryValue "$POL\CloudContent" 'DisableWindowsConsumerFeatures' 1
+    Set-RegistryValue "$POL\CloudContent" 'DisableCloudOptimizedContent' 1
+    Set-RegistryValue "$POL\Connect" 'RequirePinForPairing' 1
+    Set-RegistryValue "$POL\MicrosoftAccount" 'DisableUserAuth' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures' 'EnhancedAntiSpoofing' 1
 
     # --- AutoPlay / Explorer
-    R "$POL\Explorer" 'NoAutoplayfornonVolume' 1
-    R $PEXP 'NoAutorun' 1
-    R $PEXP 'NoDriveTypeAutoRun' 255
-    R $PEXP 'NoDataExecutionPrevention' 0
-    R $PEXP 'NoHeapTerminationOnCorruption' 0
-    R $PEXP 'PreXPSP2ShellProtocolBehavior' 0
+    Set-RegistryValue "$POL\Explorer" 'NoAutoplayfornonVolume' 1
+    Set-RegistryValue $PEXP 'NoAutorun' 1
+    Set-RegistryValue $PEXP 'NoDriveTypeAutoRun' 255
+    Set-RegistryValue $PEXP 'NoDataExecutionPrevention' 0
+    Set-RegistryValue $PEXP 'NoHeapTerminationOnCorruption' 0
+    Set-RegistryValue $PEXP 'PreXPSP2ShellProtocolBehavior' 0
 
     # --- Event logs
     foreach ($log in @(@('Application', 32768), @('Security', 196608), @('Setup', 32768), @('System', 32768))) {
-        R "$POL\EventLog\$($log[0])" 'MaxSize' $log[1]
-        R "$POL\EventLog\$($log[0])" 'Retention' '0' 'String'
+        Set-RegistryValue "$POL\EventLog\$($log[0])" 'MaxSize' $log[1]
+        Set-RegistryValue "$POL\EventLog\$($log[0])" 'Retention' '0' 'String'
     }
 
     # --- Remote Desktop client-side hardening
-    R "$WNT\Terminal Services" 'DisablePasswordSaving' 1
-    R "$WNT\Terminal Services" 'fDisableCdm' 1
-    R "$WNT\Terminal Services" 'fPromptForPassword' 1
-    R "$WNT\Terminal Services" 'fEncryptRPCTraffic' 1
-    R "$WNT\Terminal Services" 'MinEncryptionLevel' 3
+    Set-RegistryValue "$WNT\Terminal Services" 'DisablePasswordSaving' 1
+    Set-RegistryValue "$WNT\Terminal Services" 'fDisableCdm' 1
+    Set-RegistryValue "$WNT\Terminal Services" 'fPromptForPassword' 1
+    Set-RegistryValue "$WNT\Terminal Services" 'fEncryptRPCTraffic' 1
+    Set-RegistryValue "$WNT\Terminal Services" 'MinEncryptionLevel' 3
 
     # --- Misc: RSS, search, game DVR, ink, installer, PowerShell, WinRM
-    R 'HKLM:\SOFTWARE\Policies\Microsoft\Internet Explorer\Feeds' 'DisableEnclosureDownload' 1
-    R "$POL\Windows Search" 'AllowIndexingEncryptedStoresOrItems' 0
-    R "$POL\GameDVR" 'AllowGameDVR' 0
-    R "$POL\WindowsInkWorkspace" 'AllowWindowsInkWorkspace' 1
-    R "$POL\WindowsInkWorkspace" 'AllowSuggestedAppsInWindowsInkWorkspace' 0
-    R "$POL\Installer" 'EnableUserControl' 0
-    R "$POL\Installer" 'AlwaysInstallElevated' 0
-    R "$POL\PowerShell\ScriptBlockLogging" 'EnableScriptBlockLogging' 1
-    R "$POL\WinRM\Client" 'AllowBasic' 0
-    R "$POL\WinRM\Client" 'AllowUnencryptedTraffic' 0
-    R "$POL\WinRM\Client" 'AllowDigest' 0
-    R "$POL\WinRM\Service" 'AllowBasic' 0
-    R "$POL\WinRM\Service" 'AllowUnencryptedTraffic' 0
-    R "$POL\WinRM\Service" 'DisableRunAs' 1
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Internet Explorer\Feeds' 'DisableEnclosureDownload' 1
+    Set-RegistryValue "$POL\Windows Search" 'AllowIndexingEncryptedStoresOrItems' 0
+    Set-RegistryValue "$POL\GameDVR" 'AllowGameDVR' 0
+    Set-RegistryValue "$POL\WindowsInkWorkspace" 'AllowWindowsInkWorkspace' 1
+    Set-RegistryValue "$POL\WindowsInkWorkspace" 'AllowSuggestedAppsInWindowsInkWorkspace' 0
+    Set-RegistryValue "$POL\Installer" 'EnableUserControl' 0
+    Set-RegistryValue "$POL\Installer" 'AlwaysInstallElevated' 0
+    Set-RegistryValue "$POL\PowerShell\ScriptBlockLogging" 'EnableScriptBlockLogging' 1
+    Set-RegistryValue "$POL\WinRM\Client" 'AllowBasic' 0
+    Set-RegistryValue "$POL\WinRM\Client" 'AllowUnencryptedTraffic' 0
+    Set-RegistryValue "$POL\WinRM\Client" 'AllowDigest' 0
+    Set-RegistryValue "$POL\WinRM\Service" 'AllowBasic' 0
+    Set-RegistryValue "$POL\WinRM\Service" 'AllowUnencryptedTraffic' 0
+    Set-RegistryValue "$POL\WinRM\Service" 'DisableRunAs' 1
 
     # --- Windows 11 specific
-    R "$POL\WindowsAI" 'DisableAIDataAnalysis' 1      # Recall snapshots
-    R "$POL\WindowsAI" 'AllowRecallEnablement' 0
-    R "$POL\WindowsCopilot" 'TurnOffWindowsCopilot' 1
+    Set-RegistryValue "$POL\WindowsAI" 'DisableAIDataAnalysis' 1      # Recall snapshots
+    Set-RegistryValue "$POL\WindowsAI" 'AllowRecallEnablement' 0
+    Set-RegistryValue "$POL\WindowsCopilot" 'TurnOffWindowsCopilot' 1
 
     # --- Windows Update must stay enabled
-    R "$POL\WindowsUpdate\AU" 'NoAutoUpdate' 0
+    Set-RegistryValue "$POL\WindowsUpdate\AU" 'NoAutoUpdate' 0
 
-    if ($script:RegFail -eq 0) { Write-Ok "CIS administrative-template settings applied." } else { Write-Warn "Done with $($script:RegFail) registry write error(s) - see above." }
+    Write-RegistryResult -Before $regBefore -SuccessMessage "Administrative-template registry settings applied."
     Wait-Key
 }
 
@@ -836,6 +883,7 @@ function Set-ApacheSecurity {
 # 17  Force Windows Updates
 # =====================================================================
 function Invoke-WindowsUpdateForce {
+    $regBefore = $script:RegFail
     Write-Section "17) Force Windows updates (OS + Microsoft products + Defender signatures)"
     Write-Host (Get-OSLabel)
 
@@ -845,7 +893,8 @@ function Invoke-WindowsUpdateForce {
         'DeferFeatureUpdates', 'DeferQualityUpdates', 'DeferFeatureUpdatesPeriodInDays', 'DeferQualityUpdatesPeriodInDays',
         'PauseFeatureUpdatesStartTime', 'PauseQualityUpdatesStartTime') { Remove-RegValue $wu $n }
     Remove-RegValue "$wu\AU" 'UseWUServer'
-    R "$wu\AU" 'NoAutoUpdate' 0
+    Set-RegistryValue "$wu\AU" 'NoAutoUpdate' 0
+    if ($script:RegFail -gt $regBefore) { Write-Bad 'Update policy could not be written; resolve the registry errors before forcing updates.'; Wait-Key; return }
     foreach ($n in 'PauseFeatureUpdatesStartTime', 'PauseFeatureUpdatesEndTime', 'PauseQualityUpdatesStartTime', 'PauseQualityUpdatesEndTime', 'PauseUpdatesStartTime', 'PauseUpdatesExpiryTime') {
         Remove-RegValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' $n
     }
@@ -863,14 +912,14 @@ function Invoke-WindowsUpdateForce {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
             Write-Host "Installing PSWindowsUpdate module from PSGallery..." -ForegroundColor Cyan
-            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop | Out-Null
             Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-            Install-Module -Name PSWindowsUpdate -Force -Scope AllUsers -AllowClobber
+            Install-Module -Name PSWindowsUpdate -Force -Scope AllUsers -AllowClobber -ErrorAction Stop
         }
-        Import-Module PSWindowsUpdate -Force
-        Add-WUServiceManager -MicrosoftUpdateID 7971f918-a847-4430-9279-4a52d1efe18d -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        Import-Module PSWindowsUpdate -Force -ErrorAction Stop
+        Add-WUServiceManager -ServiceID '7971f918-a847-4430-9279-4a52d1efe18d' -Confirm:$false -ErrorAction Stop | Out-Null
         Write-Host "Scanning, downloading and installing all available updates (this can take a long time)..." -ForegroundColor Cyan
-        Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot -Verbose
+        Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot -Verbose -ErrorAction Stop
         $ok = $true
     }
     catch { Write-Warn "PSWindowsUpdate route failed: $($_.Exception.Message)" }
@@ -894,7 +943,8 @@ function Invoke-WindowsUpdateForce {
             if (Get-WURebootStatus -Silent) { Write-Warn "A reboot is required to finish installing updates." }
         }
     } catch {}
-    Write-Ok "Windows update pass finished. Re-run this option after rebooting until no updates remain."
+    if ($ok) { Write-Ok "Windows update pass finished. Re-run this option after rebooting until no updates remain." }
+    else { Write-Warn "Update installation is unverified. Check Settings > Windows Update; the fallback only requests background work." }
     Wait-Key
 }
 
@@ -926,12 +976,16 @@ function Update-AllApps {
         catch { Write-Bad "Could not install winget: $($_.Exception.Message)" }
     }
     if ($winget) {
-        winget source update --disable-interactivity 2>&1 | Out-Null
+        Invoke-NativeCommand -FilePath $winget.Source -ArgumentList @('source', 'update', '--disable-interactivity') | Out-Null
         Write-Host "`nUpgradable apps:" -ForegroundColor Cyan
         winget upgrade --include-unknown --accept-source-agreements
         Write-Host "`nUpgrading everything..." -ForegroundColor Cyan
-        winget upgrade --all --silent --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity
-        Write-Ok "winget upgrade pass finished."
+        $upgradeOutput = & $winget.Source upgrade --all --silent --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
+        $upgradeExit = $LASTEXITCODE
+        $upgradeOutput | ForEach-Object { Write-Host $_ }
+        if ($upgradeExit -eq 0) { Write-Ok "winget upgrade pass finished." }
+        elseif ($upgradeExit -eq -1978335189 -or $upgradeExit -eq 2316632107) { Write-Ok 'No applicable winget updates.' }
+        else { Write-Bad "winget upgrade failed (exit code $upgradeExit). Review its output above." }
     }
     else { Write-Warn "winget unavailable - update apps from the Microsoft Store (Library > Get updates)." }
     Wait-Key
@@ -941,6 +995,7 @@ function Update-AllApps {
 # 19  Defender hardening
 # =====================================================================
 function Set-DefenderHardening {
+    $regBefore = $script:RegFail
     Write-Section "19) Microsoft Defender hardening"
     try { Set-Service -Name WinDefend -StartupType Automatic -ErrorAction SilentlyContinue; Start-Service -Name WinDefend -ErrorAction SilentlyContinue } catch {}
     $dp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
@@ -949,9 +1004,11 @@ function Set-DefenderHardening {
     foreach ($n in 'DisableRealtimeMonitoring', 'DisableBehaviorMonitoring', 'DisableIOAVProtection', 'DisableOnAccessProtection', 'DisableScanOnRealtimeEnable') {
         Remove-RegValue "$dp\Real-Time Protection" $n
     }
-    R "$dp\MpEngine" 'MpEnablePus' 1
-    R "$dp\Spynet" 'LocalSettingOverrideSpynetReporting' 0
-    R "$dp\Windows Defender Exploit Guard\Network Protection" 'EnableNetworkProtection' 1
+    Set-RegistryValue "$dp\MpEngine" 'MpEnablePus' 1
+    Set-RegistryValue "$dp\Spynet" 'LocalSettingOverrideSpynetReporting' 0
+    Set-RegistryValue "$dp\Windows Defender Exploit Guard\Network Protection" 'EnableNetworkProtection' 1
+
+    Write-RegistryResult -Before $regBefore -SuccessMessage 'Defender registry policies applied.'
 
     $asr = @('26190899-1602-49e8-8b27-eb1d0a1ce869', '3b576869-a4ec-4529-8536-b80a7769e899', '56a863a9-875e-4185-98a7-b882c64b5ce5',
         '5beb7efe-fd9a-4556-801d-275e5ffc04cc', '75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84', '7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c',
@@ -977,6 +1034,7 @@ function Set-DefenderHardening {
 # 20  Network / optional features hardening
 # =====================================================================
 function Set-NetworkHardening {
+    $regBefore = $script:RegFail
     Write-Section "20) Network protocols, optional features and shares"
     try { Set-SmbServerConfiguration -EnableSMB1Protocol $false -RequireSecuritySignature $true -EnableSecuritySignature $true -Force -ErrorAction Stop; Write-Ok "SMBv1 off, SMB signing required (server)." } catch { Write-Warn "SMB server config: $($_.Exception.Message)" }
     try { Set-SmbClientConfiguration -RequireSecuritySignature $true -Force -ErrorAction Stop; Write-Ok "SMB signing required (client)." } catch { Write-Warn "SMB client config: $($_.Exception.Message)" }
@@ -992,11 +1050,11 @@ function Set-NetworkHardening {
     $sch = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
     foreach ($p in 'SSL 2.0', 'SSL 3.0') {
         foreach ($side in 'Server', 'Client') {
-            R "$sch\$p\$side" 'Enabled' 0
-            R "$sch\$p\$side" 'DisabledByDefault' 1
+            Set-RegistryValue "$sch\$p\$side" 'Enabled' 0
+            Set-RegistryValue "$sch\$p\$side" 'DisabledByDefault' 1
         }
     }
-    Write-Ok "SSL 2.0 / 3.0 disabled."
+    Write-RegistryResult -Before $regBefore -SuccessMessage "SSL 2.0 / 3.0 registry settings applied."
 
     foreach ($f in 'SMB1Protocol', 'SMB1Protocol-Client', 'SMB1Protocol-Server', 'TelnetClient', 'TFTP', 'MicrosoftWindowsPowerShellV2Root', 'MicrosoftWindowsPowerShellV2') {
         try {
@@ -1030,7 +1088,8 @@ function Set-UserRights {
     if (-not (Confirm-Action "Apply CIS user rights assignments?" $false)) { return }
 
     $backup = Join-Path $script:LogDir "secpol-backup-$($script:Stamp).inf"
-    secedit /export /cfg $backup /quiet | Out-Null
+    try { Invoke-NativeCommand -FilePath secedit.exe -ArgumentList @('/export', '/cfg', $backup, '/quiet') | Out-Null }
+    catch { Write-Bad "Policy backup failed; user rights were not changed: $_"; Wait-Key; return }
     Write-Host "Current policy backed up to $backup" -ForegroundColor Cyan
 
     $cfg = Join-Path $env:TEMP 'cp-rights.inf'
@@ -1079,10 +1138,13 @@ SeRestorePrivilege = *S-1-5-32-544
 SeShutdownPrivilege = *S-1-5-32-544,*S-1-5-32-545
 SeTakeOwnershipPrivilege = *S-1-5-32-544
 '@
-    Set-Content -Path $cfg -Value $inf -Encoding Unicode
-    secedit /configure /db (Join-Path $env:TEMP 'cp-rights.sdb') /cfg $cfg /areas USER_RIGHTS /quiet | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Ok "User rights assignments applied." } else { Write-Bad "secedit returned $LASTEXITCODE. Restore with: secedit /configure /db x.sdb /cfg `"$backup`" /areas USER_RIGHTS" }
-    Remove-Item $cfg -ErrorAction SilentlyContinue
+    try {
+        Set-Content -Path $cfg -Value $inf -Encoding Unicode -ErrorAction Stop
+        Invoke-NativeCommand -FilePath secedit.exe -ArgumentList @('/configure', '/db', (Join-Path $env:TEMP 'cp-rights.sdb'), '/cfg', $cfg, '/areas', 'USER_RIGHTS', '/quiet') | Out-Null
+        Write-Ok "User rights assignments applied."
+    }
+    catch { Write-Bad "User rights were not fully applied: $_. Backup: $backup" }
+    finally { Remove-Item -LiteralPath $cfg -ErrorAction SilentlyContinue }
     Wait-Key
 }
 
@@ -1327,26 +1389,30 @@ function Invoke-Everything {
     if (-not (Confirm-Action "Apply ALL hardening steps now?" $false)) { return }
     $doUpd = Confirm-Action "Also force Windows updates and app updates at the end (slow)?" $true
     $script:Auto = $true
-    Set-UserProperties
-    Set-AllPasswords
-    Disable-GuestAdmin
-    Invoke-ReadmeAudit
-    Set-PasswordPolicy
-    Set-LockoutPolicy
-    Enable-WindowsFirewall
-    Disable-UnnecessaryServices
-    Enable-UAC
-    Set-RemoteDesktop
-    Enable-AutoUpdate
-    Set-SecurityOptions
-    Set-AdvancedSecurity
-    Enable-Auditing
-    Set-DefenderHardening
-    Set-NetworkHardening
-    Set-UserRights
-    if ($doUpd) { Invoke-WindowsUpdateForce; Update-AllApps }
-    $script:Auto = $false
-    Write-Ok "`nAll selected steps finished. Still do manually: user/admin audit (14), media search (7), Apache (16), README items."
+    $failureBefore = $script:FailureCount
+    try {
+        Set-UserProperties
+        Set-AllPasswords
+        Disable-GuestAdmin
+        Invoke-ReadmeAudit
+        Set-PasswordPolicy
+        Set-LockoutPolicy
+        Enable-WindowsFirewall
+        Disable-UnnecessaryServices
+        Enable-UAC
+        Set-RemoteDesktop
+        Enable-AutoUpdate
+        Set-SecurityOptions
+        Set-AdvancedSecurity
+        Enable-Auditing
+        Set-DefenderHardening
+        Set-NetworkHardening
+        Set-UserRights
+        if ($doUpd) { Invoke-WindowsUpdateForce; Update-AllApps }
+    }
+    finally { $script:Auto = $false }
+    if ($script:FailureCount -gt $failureBefore) { Write-Bad "Selected steps finished with errors. Review the transcript and rerun the failed options." }
+    else { Write-Host "Selected steps finished. Review all warnings and finish media search (7), Apache (16), and README items manually." }
     if (Confirm-Action "Reboot now to apply everything?" $false) { Stop-Transcript | Out-Null; Restart-Computer -Force }
 }
 
@@ -1398,36 +1464,39 @@ if ($answer -ne 'y') {
 do {
     Show-Menu
     $choice = Read-Host "`nPlease choose an option"
-    switch ($choice) {
-        '1'  { Set-UserProperties }
-        '2'  { Set-AllPasswords }
-        '3'  { Disable-GuestAdmin }
-        '4'  { Set-PasswordPolicy }
-        '5'  { Set-LockoutPolicy }
-        '6'  { Enable-WindowsFirewall }
-        '7'  { Search-MediaFiles }
-        '8'  { Disable-UnnecessaryServices }
-        '9'  { Enable-UAC }
-        '10' { Set-RemoteDesktop }
-        '11' { Enable-AutoUpdate }
-        '12' { Set-SecurityOptions }
-        '13' { Enable-Auditing }
-        '14' { Edit-Groups }
-        '15' { Set-AdvancedSecurity }
-        '16' { Set-ApacheSecurity }
-        '17' { Invoke-WindowsUpdateForce }
-        '18' { Update-AllApps }
-        '19' { Set-DefenderHardening }
-        '20' { Set-NetworkHardening }
-        '21' { Set-UserRights }
-        '22' { Invoke-Recon }
-        '23' { Invoke-ReadmeAudit }
-        '88' { Invoke-Everything }
-        '69' { try { Stop-Transcript | Out-Null } catch {}; exit }
-        '70' { try { Stop-Transcript | Out-Null } catch {}; Restart-Computer -Force }
-        default {
-            Write-Bad "Invalid option. Please try again."
-            Start-Sleep -Seconds 2
+    try {
+        switch ($choice) {
+            '1'  { Set-UserProperties }
+            '2'  { Set-AllPasswords }
+            '3'  { Disable-GuestAdmin }
+            '4'  { Set-PasswordPolicy }
+            '5'  { Set-LockoutPolicy }
+            '6'  { Enable-WindowsFirewall }
+            '7'  { Search-MediaFiles }
+            '8'  { Disable-UnnecessaryServices }
+            '9'  { Enable-UAC }
+            '10' { Set-RemoteDesktop }
+            '11' { Enable-AutoUpdate }
+            '12' { Set-SecurityOptions }
+            '13' { Enable-Auditing }
+            '14' { Edit-Groups }
+            '15' { Set-AdvancedSecurity }
+            '16' { Set-ApacheSecurity }
+            '17' { Invoke-WindowsUpdateForce }
+            '18' { Update-AllApps }
+            '19' { Set-DefenderHardening }
+            '20' { Set-NetworkHardening }
+            '21' { Set-UserRights }
+            '22' { Invoke-Recon }
+            '23' { Invoke-ReadmeAudit }
+            '88' { Invoke-Everything }
+            '69' { try { Stop-Transcript | Out-Null } catch {}; exit }
+            '70' { try { Stop-Transcript | Out-Null } catch {}; Restart-Computer -Force }
+            default {
+                Write-Bad "Invalid option. Please try again."
+                Start-Sleep -Seconds 2
+            }
         }
     }
+    catch { Write-Bad "Option $choice failed: $($_.Exception.Message)"; Wait-Key }
 } while ($true)
