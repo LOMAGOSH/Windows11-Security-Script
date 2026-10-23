@@ -33,14 +33,42 @@ function Test-AdminRights {
     return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Show-Popup {
+    param(
+        [string]$Text,
+        [string]$Title = 'CyberPatriot Hardening',
+        [string]$Buttons = 'OK',
+        [string]$Icon = 'Warning'
+    )
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        return [System.Windows.Forms.MessageBox]::Show($Text, $Title,
+            [System.Windows.Forms.MessageBoxButtons]::$Buttons,
+            [System.Windows.Forms.MessageBoxIcon]::$Icon)
+    }
+    catch {
+        Write-Host $Text -ForegroundColor Yellow
+        return 'Yes'
+    }
+}
+
 if (-not $PSCommandPath) {
-    Write-Host "Save this script as a .ps1 file and run it from there." -ForegroundColor Red
+    Show-Popup -Text "Save this script as a .ps1 file and run it from there." -Title 'Cannot run' -Icon 'Error' | Out-Null
     exit 1
 }
 
 if (-not (Test-AdminRights)) {
-    Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    $answer = Show-Popup -Title 'Administrator required' -Buttons 'YesNo' -Icon 'Warning' -Text ("This script must be run as Administrator.`n`n" +
+        "Click YES to relaunch it as Administrator now (you will get a UAC prompt).`n" +
+        "Click NO to close it.`n`n" +
+        "Tip: you can also open PowerShell or Windows Terminal with 'Run as administrator' and start the script from there.")
+    if ("$answer" -ne 'Yes') { exit }
+    try {
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs -ErrorAction Stop
+    }
+    catch {
+        Show-Popup -Title 'Administrator required' -Icon 'Error' -Text "Administrator access was denied or cancelled. The script cannot continue without it." | Out-Null
+    }
     exit
 }
 
@@ -1121,6 +1149,171 @@ function Invoke-Recon {
 }
 
 # =====================================================================
+# 23  README audit (authorized users / administrators)
+# =====================================================================
+function Get-ReadmeText {
+    param([string]$Path)
+    if ($Path -match '\.url$') {
+        # Desktop shortcut to the README: read the target
+        $target = (Get-Content -LiteralPath $Path | Where-Object { $_ -match '^URL=' } | Select-Object -First 1) -replace '^URL=', ''
+        if ($target -match '^file:') { $Path = ([Uri]$target).LocalPath }
+        elseif ($target -match '^https?:') {
+            $raw = (Invoke-WebRequest -Uri $target -UseBasicParsing).Content
+            $Path = $null
+        }
+        else { throw "Unsupported shortcut target: $target" }
+    }
+    if ($Path) { $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop }
+    $t = $raw -replace '(?is)<(script|style).*?</\1>', ''
+    $t = $t -replace '(?i)<br\s*/?>|</p>|</div>|</li>|</tr>|</h\d>|</pre>', "`n"
+    $t = $t -replace '<[^>]+>', ''
+    $t = [System.Net.WebUtility]::HtmlDecode($t)
+    return ($t -replace "`r", '')
+}
+
+function Find-ReadmeFile {
+    $dirs = @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('CommonDesktopDirectory'))
+    $dirs += Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'Desktop' }
+    $dirs = $dirs | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+    $found = @()
+    foreach ($d in $dirs) {
+        $found += Get-ChildItem -Path $d -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'read\s*me' -and $_.Extension -match '^\.(html?|txt|md|url)$' }
+    }
+    return $found
+}
+
+function Read-AuthorizedLists {
+    param([string]$Text)
+    $admins = New-Object System.Collections.Generic.List[string]
+    $users = New-Object System.Collections.Generic.List[string]
+    $mode = $null
+    foreach ($line in ($Text -split "`n")) {
+        $l = $line.Trim()
+        if ($l -match '^Authorized Administrators?\s*:') { $mode = 'admin'; continue }
+        if ($l -match '^Authorized Users?\s*:') { $mode = 'user'; continue }
+        if (-not $mode -or -not $l) { continue }
+        if ($l -match '^(password|pass|pw)\s*:') { continue }
+        if ($l -match '^([A-Za-z0-9._\-\$]+)(\s*\((you|me|this account)\))?\s*$') {
+            if ($mode -eq 'admin') { $admins.Add($Matches[1]) } else { $users.Add($Matches[1]) }
+        }
+        else { $mode = $null }   # a prose line means the list has ended
+    }
+    return [pscustomobject]@{ Admins = @($admins); Users = @($users) }
+}
+
+function Invoke-ReadmeAudit {
+    Write-Section "23) README audit - authorized users and administrators"
+    $file = $null
+    $cands = @(Find-ReadmeFile)
+    if ($cands.Count -eq 1) { $file = $cands[0].FullName; Write-Host "Found README: $file" -ForegroundColor Cyan }
+    elseif ($cands.Count -gt 1) {
+        for ($i = 0; $i -lt $cands.Count; $i++) { Write-Host ("{0}) {1}" -f ($i + 1), $cands[$i].FullName) }
+        $n = Read-Host "Pick a README number (Enter to type a path instead)"
+        if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $cands.Count) { $file = $cands[[int]$n - 1].FullName }
+    }
+    if (-not $file) {
+        $p = Read-Host "Full path to the README file (Enter to type the names by hand)"
+        if ($p -and (Test-Path -LiteralPath $p)) { $file = $p }
+    }
+
+    $adminList = @(); $userList = @()
+    if ($file) {
+        try {
+            $parsed = Read-AuthorizedLists -Text (Get-ReadmeText -Path $file)
+            $adminList = @($parsed.Admins); $userList = @($parsed.Users)
+        }
+        catch { Write-Bad "Could not read README: $($_.Exception.Message)" }
+    }
+    if ($adminList.Count -gt 0 -or $userList.Count -gt 0) {
+        Write-Host "`nParsed from README:" -ForegroundColor Cyan
+        Write-Host ("  Authorized administrators: " + ($adminList -join ', '))
+        Write-Host ("  Authorized users:          " + ($userList -join ', '))
+        if (-not (Confirm-Action "Do these lists look right?" $true)) { $adminList = @(); $userList = @() }
+    }
+    if ($adminList.Count -eq 0 -and $userList.Count -eq 0) {
+        $adminList = @((Read-Host "Authorized ADMIN usernames, comma separated") -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $userList = @((Read-Host "Authorized standard USER usernames, comma separated") -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($adminList.Count -eq 0 -and $userList.Count -eq 0) { Write-Warn "No lists provided."; Wait-Key; return }
+    }
+
+    $authAdmin = @($adminList | ForEach-Object { $_.ToLower() })
+    $authAll = @($authAdmin) + @($userList | ForEach-Object { $_.ToLower() })
+    $me = $script:CurrentUserName.ToLower()
+    $rep = New-Object System.Collections.Generic.List[string]
+    $say = { param($t, $c = 'White') Write-Host $t -ForegroundColor $c; $rep.Add($t) }
+
+    if ($authAll -notcontains $me) { & $say "WARNING: you ($($script:CurrentUserName)) are not in the README lists. This tool never changes your own account." 'Yellow' }
+
+    $local = @(Get-LocalUser)
+    $localNames = @($local | ForEach-Object { $_.Name.ToLower() })
+    $admMembers = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue)
+    $admShort = @($admMembers | ForEach-Object { $_.Name.Split('\')[-1].ToLower() })
+
+    $unauth = @($local | Where-Object { $_.SID.Value -notmatch '-(500|501|503|504)$' -and $authAll -notcontains $_.Name.ToLower() })
+    $adminBad = @($admMembers | Where-Object { $_.ObjectClass -eq 'User' -and $_.SID.Value -notmatch '-500$' -and $authAdmin -notcontains $_.Name.Split('\')[-1].ToLower() })
+    $adminMissing = @($authAdmin | Where-Object { $localNames -contains $_ -and $admShort -notcontains $_ })
+    $noAccount = @($authAll | Where-Object { $localNames -notcontains $_ })
+
+    & $say "`n=== README AUDIT REPORT ===" 'Cyan'
+    & $say "Currently in the Administrators group:" 'Cyan'
+    foreach ($m in $admMembers) {
+        $short = $m.Name.Split('\')[-1].ToLower()
+        if ($m.ObjectClass -ne 'User') { & $say "  $($m.Name)  [$($m.ObjectClass)]  -> review manually" 'Yellow' }
+        elseif ($m.SID.Value -match '-500$') { & $say "  $($m.Name)  [built-in Administrator - use option 3 to disable]" 'Gray' }
+        elseif ($authAdmin -contains $short) { & $say "  $($m.Name)  OK - authorized administrator" 'Green' }
+        elseif ($authAll -contains $short) { & $say "  $($m.Name)  REMOVE - authorized user, but NOT an authorized administrator" 'Red' }
+        else { & $say "  $($m.Name)  REMOVE - not in the README at all" 'Red' }
+    }
+    & $say "`nUnauthorized local users (not in README):" 'Cyan'
+    if ($unauth.Count -eq 0) { & $say "  none" 'Green' }
+    else { foreach ($u in $unauth) { & $say ("  {0}  (enabled: {1})" -f $u.Name, $u.Enabled) 'Red' } }
+    & $say "`nAuthorized administrators missing from the Administrators group:" 'Cyan'
+    if ($adminMissing.Count -eq 0) { & $say "  none" 'Green' } else { foreach ($n in $adminMissing) { & $say "  $n" 'Yellow' } }
+    & $say "`nREADME names with no local account:" 'Cyan'
+    if ($noAccount.Count -eq 0) { & $say "  none" 'Green' } else { foreach ($n in $noAccount) { & $say "  $n" 'Yellow' } }
+
+    $reportPath = Join-Path $script:LogDir "README-Audit-$($script:Stamp).txt"
+    $rep | Set-Content -Path $reportPath -Encoding UTF8
+    Write-Host "`nReport saved to $reportPath" -ForegroundColor Cyan
+
+    if ($adminBad.Count -eq 0 -and $unauth.Count -eq 0 -and $adminMissing.Count -eq 0) { Write-Ok "Nothing to change."; Wait-Key; return }
+
+    $act = Read-Host "Apply changes? [R]eport only / [A]sk for each (default) / [Y] apply all"
+    if ($act -match '^[rR]') { Wait-Key; return }
+    $auto = ($act -match '^[yY]')
+    $how = Read-Host "Unauthorized users: [D]isable (default, reversible) or delete [X]?"
+    $delete = ($how -match '^[xX]')
+
+    foreach ($m in $adminBad) {
+        $short = $m.Name.Split('\')[-1]
+        if ($short.ToLower() -eq $me) { Write-Warn "Skipping your own account ($short)."; continue }
+        if ($auto -or (Confirm-Action "Remove '$($m.Name)' from Administrators?" $true)) {
+            try { Remove-LocalGroupMember -Group 'Administrators' -Member $m.Name -ErrorAction Stop; Write-Ok "Removed $($m.Name) from Administrators" }
+            catch { Write-Bad "Failed: $($_.Exception.Message)" }
+        }
+    }
+    foreach ($u in $unauth) {
+        if ($u.Name.ToLower() -eq $me) { Write-Warn "Skipping your own account ($($u.Name))."; continue }
+        $verb = if ($delete) { 'DELETE' } else { 'Disable' }
+        if ($auto -or (Confirm-Action "$verb unauthorized user '$($u.Name)'?" $true)) {
+            try {
+                if ($delete) { Remove-LocalUser -Name $u.Name -ErrorAction Stop } else { Disable-LocalUser -Name $u.Name -ErrorAction Stop }
+                Write-Ok "$verb done: $($u.Name)"
+            }
+            catch { Write-Bad "Failed: $($_.Exception.Message)" }
+        }
+    }
+    foreach ($n in $adminMissing) {
+        if (Confirm-Action "'$n' is an authorized admin but not in Administrators. Add?" $false) {
+            try { Add-LocalGroupMember -Group 'Administrators' -Member $n -ErrorAction Stop; Write-Ok "Added $n to Administrators" }
+            catch { Write-Bad "Failed: $($_.Exception.Message)" }
+        }
+    }
+    Wait-Key
+}
+
+# =====================================================================
 # 88  Run everything
 # =====================================================================
 function Invoke-Everything {
@@ -1132,6 +1325,7 @@ function Invoke-Everything {
     Set-UserProperties
     Set-AllPasswords
     Disable-GuestAdmin
+    Invoke-ReadmeAudit
     Set-PasswordPolicy
     Set-LockoutPolicy
     Enable-WindowsFirewall
@@ -1180,7 +1374,7 @@ function Show-Menu {
         @('19) Defender hardening', '20) Network/features/shares'),
         @('21) User rights (CIS 2.2)', '22) Recon / forensics helpers'),
         @('88) RUN EVERYTHING', '70) Reboot'),
-        @('69) Exit', '')
+        @('23) README user/admin audit', '69) Exit')
     )
     foreach ($r in $rows) { Write-Host ("{0,-38}{1}" -f $r[0], $r[1]) }
     Write-Host $line -ForegroundColor Cyan
@@ -1222,6 +1416,7 @@ do {
         '20' { Set-NetworkHardening }
         '21' { Set-UserRights }
         '22' { Invoke-Recon }
+        '23' { Invoke-ReadmeAudit }
         '88' { Invoke-Everything }
         '69' { try { Stop-Transcript | Out-Null } catch {}; exit }
         '70' { try { Stop-Transcript | Out-Null } catch {}; Restart-Computer -Force }
