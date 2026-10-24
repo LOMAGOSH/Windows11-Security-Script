@@ -23,7 +23,9 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
 # =====================================================================
 # SETTINGS - edit these to match the README / your preferences
 # =====================================================================
-$DefaultNewPassword = '1qaz!QAZ2wsx@WSX'   # used only if you press Enter at the password prompt
+$DefaultNewPassword = '1qaz!QAZ2wsx@WSX'   # used automatically by password-change and user-creation tasks
+$DefaultLogonCaption = 'WARNING - AUTHORIZED USERS ONLY'
+$DefaultLogonText = 'This computer is for authorized users only. If you do not have explicit permission, you are not allowed to access or use this PC. Activity may be monitored and recorded. Unauthorized access or misuse may result in disciplinary action and/or legal action. Disconnect immediately if you are not authorized.'
 $PwHistory     = 24
 $PwMaxAge      = 60     # CIS: 365 or fewer, not 0. CyberPatriot usually wants 30-90
 $PwMinAge      = 1      # CIS: 1 or more
@@ -123,6 +125,11 @@ function Confirm-Action {
     $a = Read-Host "$Prompt $hint"
     if ([string]::IsNullOrWhiteSpace($a)) { return $Default }
     return ($a -match '^[yY]')
+}
+
+function Get-DefaultAccountPassword {
+    if ([string]::IsNullOrEmpty($DefaultNewPassword)) { throw 'DefaultNewPassword is empty; configure it in the settings block.' }
+    ConvertTo-SecureString -String $DefaultNewPassword -AsPlainText -Force
 }
 
 # Use a full command name: the built-in R alias resolves to Invoke-History.
@@ -299,11 +306,9 @@ function Set-UserProperties {
 # =====================================================================
 function Set-AllPasswords {
     Write-Section "2) Change all passwords"
-    Write-Host "Type a new password for every ENABLED local account."
-    Write-Host "Press Enter with nothing typed to use the default set in the script settings."
-    $in = Read-Host "New password" -AsSecureString
-    if ($in.Length -eq 0) { $sec = ConvertTo-SecureString $DefaultNewPassword -AsPlainText -Force } else { $sec = $in }
-    $skipSelf = -not (Confirm-Action "Also change the password of YOUR current account ($($script:CurrentUserName))?" $false)
+    Write-Host 'Using the configured default password for enabled local accounts. No password entry is needed.'
+    $sec = Get-DefaultAccountPassword
+    $skipSelf = -not (Confirm-Action "Also change the password of YOUR current account ($($script:CurrentUserName))?" $true)
     foreach ($u in (Get-LocalUser | Where-Object { $_.Enabled })) {
         if ($skipSelf -and $u.Name -eq $script:CurrentUserName) { Write-Warn "Skipped current account $($u.Name)"; continue }
         try {
@@ -601,11 +606,6 @@ function Set-SecurityOptions {
     $V = 'HKLM:\SYSTEM\CurrentControlSet\Services'
     $W = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 
-    $body = Read-Host "Logon banner text (Enter = default)"
-    if ([string]::IsNullOrWhiteSpace($body)) { $body = 'Authorized users only. Activity may be monitored and recorded.' }
-    $subject = Read-Host "Logon banner title (Enter = default)"
-    if ([string]::IsNullOrWhiteSpace($subject)) { $subject = 'Authorized Use Only' }
-
     # Accounts
     Set-RegistryValue $S 'NoConnectedUser' 3                         # block Microsoft accounts
     Set-RegistryValue $L 'LimitBlankPasswordUse' 1
@@ -632,8 +632,8 @@ function Set-SecurityOptions {
     Set-RegistryValue $S 'DisableCAD' 0
     Set-RegistryValue $S 'DontDisplayLastUserName' 1
     Set-RegistryValue $S 'InactivityTimeoutSecs' 900
-    Set-RegistryValue $S 'legalnoticetext' $body 'String'
-    Set-RegistryValue $S 'legalnoticecaption' $subject 'String'
+    Set-RegistryValue $S 'legalnoticetext' $DefaultLogonText 'String'
+    Set-RegistryValue $S 'legalnoticecaption' $DefaultLogonCaption 'String'
     Set-RegistryValue $S 'undockwithoutlogon' 0
     Set-RegistryValue $S 'ShutdownWithoutLogon' 0
     Set-RegistryValue $W 'CachedLogonsCount' '4' 'String'
@@ -820,7 +820,7 @@ function Edit-Groups {
             }
             '4' {
                 $n = Read-Host "New username"
-                $p = Read-Host "Password" -AsSecureString
+                $p = Get-DefaultAccountPassword
                 try { New-LocalUser -Name $n -Password $p -PasswordNeverExpires:$false -ErrorAction Stop | Out-Null; Add-LocalGroupMember -Group 'Users' -Member $n; Write-Ok "Created $n" } catch { Write-Bad "Failed: $_" }
                 Wait-Key
             }

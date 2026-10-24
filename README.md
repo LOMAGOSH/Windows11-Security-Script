@@ -11,6 +11,20 @@ accounts can be disabled; account deletion is unavailable. Removing a group
 membership does not delete an account. Review prompts and the transcript saved to
 the Desktop (or TEMP if the Desktop is unavailable).
 
+Option 2 uses `DefaultNewPassword` from the script settings automatically, without
+asking you to type a password. It changes enabled local accounts and keeps a
+separate confirmation for changing your currently signed-in account (default Yes;
+choose No to skip it). New users
+created from option 14 or the guided walkthrough, and individual walkthrough
+password resets, use the same configured default. Windows password policy and
+history can still reject a change; those failures are reported.
+
+Option 12 applies the configured authorized-use logon warning automatically,
+including a warning that unauthorized users must disconnect and that activity
+may be monitored. No banner title/text entry is required. To customize these
+defaults later, edit `DefaultLogonCaption`, `DefaultLogonText`, and
+`DefaultNewPassword` in the main script's settings block.
+
 The registry writer uses `Set-RegistryValue`; `R` is PowerShell's built-in history
 alias and must not be used for registry changes. Failed writes and nonzero native
 policy-command results are reported as errors. CIS references identify intended

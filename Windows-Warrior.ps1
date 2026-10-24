@@ -10,9 +10,9 @@ function Get-WarriorTasks {
 2|Disable built-in Administrator|Disable-LocalUser -Name Administrator|Disables the built-in administrator; protects the account running this tool.|lusrmgr.msc > Users > Administrator > Properties > Account is disabled
 3|Disable unauthorized hacker account|Disable-LocalUser -Name hacker|Disables hacker and removes its administrator membership. Accounts are NEVER deleted, including in this tutorial.|lusrmgr.msc > Users > hacker > Properties > Account is disabled
 4|Remove webdev from Administrators|Remove-LocalGroupMember -Group Administrators -Member webdev|Removes administrator privileges while preserving the webdev account.|lusrmgr.msc > Groups > Administrators > webdev > Remove
-5|Require a password for intern|Set-LocalUser -Name intern -Password (Read-Host -AsSecureString); net.exe user intern /passwordreq:yes|Prompts securely for a password of at least 12 characters; never uses the tutorial's shared example password.|lusrmgr.msc > Users > intern > Set Password; Properties > require a password
+5|Require a password for intern|Set-LocalUser -Name intern -Password (Get-DefaultAccountPassword); net.exe user intern /passwordreq:yes|Uses the configured default password automatically and marks the selected account's password as required.|lusrmgr.msc > Users > selected account > Set Password; password-required flag uses net.exe
 6|Make contractor password expire|Set-LocalUser -Name contractor -PasswordNeverExpires $false|Subjects contractor to the account password-expiration policy.|lusrmgr.msc > Users > contractor > Properties > clear Password never expires
-7|Create standard user analyst|New-LocalUser -Name analyst -Password (Read-Host -AsSecureString)|Creates analyst if absent, adds it to Users and ensures it is not an administrator.|lusrmgr.msc > Users > New User; Groups > Users > Add analyst
+7|Create standard user analyst|New-LocalUser -Name analyst -Password (Get-DefaultAccountPassword)|Creates the selected account with the configured default password if absent, adds it to Users and ensures it is not an administrator.|lusrmgr.msc > Users > New User; Groups > Users > Add selected account
 8|Minimum password length at least 12|net.exe accounts /minpwlen:12|Uses at least 12 characters, retaining the stronger toolkit minimum when configured.|secpol.msc > Account Policies > Password Policy > Minimum password length
 9|Enable password complexity|secedit.exe /configure /db policy.sdb /cfg complexity.inf /areas SECURITYPOLICY|Applies a backed-up security template enabling complexity and disabling reversible encryption.|secpol.msc > Account Policies > Password Policy > Password must meet complexity requirements
 10|Maximum password age at most 90 days|net.exe accounts /maxpwage:90|Requires periodic password changes, retaining the stronger toolkit maximum age.|secpol.msc > Account Policies > Password Policy > Maximum password age
@@ -118,13 +118,6 @@ function Disable-WarriorAccount {
     if ($user.Enabled) { Disable-LocalUser -Name $user.Name -ErrorAction Stop }
 }
 
-function Read-WarriorPassword {
-    param([string]$Account)
-    $password = Read-Host "New password for $Account (at least 12 characters)" -AsSecureString
-    if ($password.Length -lt 12) { throw 'Password must be at least 12 characters; the system complexity policy also applies.' }
-    $password
-}
-
 function Stop-WarriorService {
     param([string]$Name)
     $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
@@ -193,7 +186,7 @@ function Invoke-WarriorTaskAction {
         4 { Remove-WarriorAdminMembership -Name (Get-WarriorTarget 'Standard user who should not be an administrator' Standard) }
         5 {
             $name = Get-WarriorTarget 'Authorized account requiring a new password' Authorized
-            Set-LocalUser -Name $name -Password (Read-WarriorPassword $name) -ErrorAction Stop
+            Set-LocalUser -Name $name -Password (Get-DefaultAccountPassword) -ErrorAction Stop
             Invoke-NativeCommand -FilePath net.exe -ArgumentList @('user', $name, '/passwordreq:yes') | Out-Null
         }
         6 { Set-LocalUser -Name (Get-WarriorTarget 'Authorized account whose password must expire' Authorized) -PasswordNeverExpires $false -ErrorAction Stop }
@@ -203,7 +196,7 @@ function Invoke-WarriorTaskAction {
                 throw 'This account is the current user or an approved administrator; it cannot be reconciled as a standard user.'
             }
             if (-not (Get-LocalUser -Name $name -ErrorAction SilentlyContinue)) {
-                New-LocalUser -Name $name -Password (Read-WarriorPassword $name) -PasswordNeverExpires:$false -ErrorAction Stop | Out-Null
+                New-LocalUser -Name $name -Password (Get-DefaultAccountPassword) -PasswordNeverExpires:$false -ErrorAction Stop | Out-Null
             }
             $group = Get-WarriorGroupName 'S-1-5-32-545'
             $user = Get-LocalUser -Name $name -ErrorAction Stop

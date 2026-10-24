@@ -81,6 +81,7 @@ $script:LogDir=$temporary
 $env:ProgramData=Join-Path $temporary 'ProgramData'
 $env:SystemDrive=$temporary
 $PwMinLen=14; $PwMaxAge=60; $PwMinAge=1; $PwHistory=24; $LockThreshold=5; $LockDuration=30; $LockWindow=30
+$DefaultNewPassword='Fixture-only-default-A9!'
 try {
     Test-Case 'All 50 task cards have commands, explanations and GUI instructions' {
         $tasks=@(Get-WarriorTasks)
@@ -130,10 +131,17 @@ try {
         Assert-True ($script:actions[0].Name -eq 'jrhodes' -and $script:actions[0].Value -eq $false) 'Selected account expiration enabled'
     }
     Test-Case 'A different authorized standard account is created and added to Users' {
-        Reset-Records; $script:inputQueue.Enqueue('tchalla'); $script:inputQueue.Enqueue('Test-only-Passphrase-123!')
+        Reset-Records; $script:inputQueue.Enqueue('tchalla')
         Invoke-WarriorTaskAction 7
         Assert-True (@($script:actions | Where-Object { $_.Kind -eq 'CreateAccount' -and $_.Name -eq 'tchalla' }).Count -eq 1) 'Selected account created'
         Assert-True (@($script:actions | Where-Object { $_.Kind -eq 'AddMembership' -and $_.Value -eq 'LocalizedUsers' }).Count -eq 1) 'Standard Users membership granted'
+        Assert-True ($script:inputQueue.Count -eq 0) 'No password-entry prompt needed'
+    }
+    Test-Case 'An image-specific password reset uses the configured default without requesting another password' {
+        Reset-Records; $script:inputQueue.Enqueue('jrhodes')
+        Invoke-WarriorTaskAction 5
+        Assert-True (@($script:actions | Where-Object { $_.Kind -eq 'SetAccount' -and $_.Name -eq 'jrhodes' }).Count -eq 1) 'Selected account password set'
+        Assert-True ($script:inputQueue.Count -eq 0) 'No password-entry prompt needed'
     }
     Test-Case 'Generic account-policy steps retain stronger configured thresholds' {
         Reset-Records

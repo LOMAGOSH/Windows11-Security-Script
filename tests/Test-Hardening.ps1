@@ -198,8 +198,53 @@ $env:TEMP = $testTemp
 $env:SystemRoot = Join-Path $testTemp 'Windows'
 $PwHistory = 24; $PwMaxAge = 60; $PwMinAge = 1; $PwMinLen = 14
 $LockThreshold = 5; $LockDuration = 30; $LockWindow = 30
+$DefaultNewPassword = 'Fixture-only-default-A9!'
+$DefaultLogonCaption = 'Fixture authorized-use caption'
+$DefaultLogonText = 'Fixture warning: this computer is for authorized users only.'
 $script:LogDir = $testTemp; $script:Stamp = 'test'
 try {
+    Test-Case 'Password changes use the configured default without a password prompt and protect the current account' {
+        Reset-Records
+        $script:CurrentUserName = 'student'
+        $script:passwordChanges = @{}
+        function Read-Host { throw 'Unexpected password-entry prompt' }
+        function Confirm-Action { return $false }
+        function Get-LocalUser {
+            @([pscustomobject]@{Name='alice';Enabled=$true},[pscustomobject]@{Name='student';Enabled=$true},[pscustomobject]@{Name='disabled';Enabled=$false})
+        }
+        function Set-LocalUser {
+            param($Name,[securestring]$Password,$ErrorAction)
+            $script:passwordChanges[$Name] = (New-Object System.Management.Automation.PSCredential('fixture',$Password)).GetNetworkCredential().Password
+        }
+        Set-AllPasswords
+        Assert-True ($script:passwordChanges.Count -eq 1 -and $script:passwordChanges['alice'] -ceq $DefaultNewPassword) 'Default applied to enabled account'
+        Assert-True (-not $script:passwordChanges.ContainsKey('student') -and -not $script:passwordChanges.ContainsKey('disabled')) 'Current and disabled accounts skipped'
+    }
+    Test-Case 'Password changes include the current account when its separate confirmation is accepted' {
+        Reset-Records
+        $script:CurrentUserName = 'student'
+        $script:passwordChanges = @{}
+        function Read-Host { throw 'Unexpected password-entry prompt' }
+        function Confirm-Action { param($Prompt,$Default) $script:currentAccountConfirmationDefault=$Default; return $true }
+        function Get-LocalUser { [pscustomobject]@{Name='student';Enabled=$true} }
+        function Set-LocalUser {
+            param($Name,[securestring]$Password,$ErrorAction)
+            $script:passwordChanges[$Name] = (New-Object System.Management.Automation.PSCredential('fixture',$Password)).GetNetworkCredential().Password
+        }
+        Set-AllPasswords
+        Assert-True ($script:passwordChanges['student'] -ceq $DefaultNewPassword) 'Confirmed current-account password changed'
+        Assert-True $script:currentAccountConfirmationDefault 'Current-account confirmation defaults to Yes'
+    }
+    Test-Case 'Security options apply the default authorized-use banner without asking for text' {
+        Reset-Records
+        function Read-Host { throw 'Unexpected logon-banner prompt' }
+        Set-SecurityOptions
+        $caption=@($script:writes | Where-Object Name -eq legalnoticecaption)
+        $body=@($script:writes | Where-Object Name -eq legalnoticetext)
+        Assert-True ($caption.Count -eq 1 -and $caption[0].Value -ceq $DefaultLogonCaption) 'Configured caption written'
+        Assert-True ($body.Count -eq 1 -and $body[0].Value -ceq $DefaultLogonText) 'Configured warning written'
+        Assert-True ($script:bad.Count -eq 0) 'Banner needs no input'
+    }
     Test-Case 'Option 4 configures every password setting and NoLMHash' {
         Reset-Records
         Set-PasswordPolicy
