@@ -172,6 +172,96 @@ function Invoke-NativeCommand {
     $output
 }
 
+function Assert-MicrosoftLgpoSignature {
+    param([string]$Path)
+    $signature = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
+    if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
+        $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
+        throw "LGPO.exe must have a valid Microsoft Corporation signature: $Path"
+    }
+}
+
+function Get-LgpoExecutable {
+    $cache = Join-Path $env:ProgramData 'CyberPatriot-Hardening\Tools'
+    $cachedExe = Join-Path $cache 'LGPO.exe'
+    foreach ($candidate in @((Join-Path $PSScriptRoot 'tools\LGPO.exe'), $cachedExe)) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            Assert-MicrosoftLgpoSignature -Path $candidate
+            return $candidate
+        }
+    }
+    # Official Microsoft Security Compliance Toolkit distribution. Never use an
+    # unsigned mirror or bypass TLS/signature validation if this download fails.
+    $url = 'https://download.microsoft.com/download/8/5/C/85C25433-A1B0-4FFA-9429-7E023E7F3F39/LGPO.zip'
+    $scratch = Join-Path $env:TEMP ('cp-lgpo-' + [guid]::NewGuid())
+    $previousTls = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        $null = [IO.Directory]::CreateDirectory($scratch)
+        $zip = Join-Path $scratch 'LGPO.zip'
+        [Net.ServicePointManager]::SecurityProtocol = $previousTls -bor [Net.SecurityProtocolType]::Tls12
+        Write-Host 'Downloading Microsoft LGPO to persist advanced audit settings in Local Group Policy...'
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+        Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $scratch 'expanded') -ErrorAction Stop
+        $executables = @(Get-ChildItem -LiteralPath (Join-Path $scratch 'expanded') -Recurse -File -Filter LGPO.exe -ErrorAction Stop)
+        if ($executables.Count -ne 1) { throw 'The Microsoft archive did not contain exactly one LGPO.exe.' }
+        Assert-MicrosoftLgpoSignature -Path $executables[0].FullName
+        $null = [IO.Directory]::CreateDirectory($cache)
+        Copy-Item -LiteralPath $executables[0].FullName -Destination $cachedExe -ErrorAction Stop
+        Assert-MicrosoftLgpoSignature -Path $cachedExe
+        return $cachedExe
+    }
+    catch {
+        throw "Cannot prepare Microsoft LGPO: $($_.Exception.Message). Alternatively, download LGPO from Microsoft's Security Compliance Toolkit (https://www.microsoft.com/download/details.aspx?id=55319) and place its signed LGPO.exe in the tools folder beside this script."
+    }
+    finally {
+        [Net.ServicePointManager]::SecurityProtocol = $previousTls
+        if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Read-SystemAuditPolicy {
+    param([string]$Path)
+    # auditpol localizes CSV headers; the seven-column schema is fixed.
+    $headers = 'Machine Name', 'Policy Target', 'Subcategory', 'Subcategory GUID', 'Inclusion Setting', 'Exclusion Setting', 'Setting Value'
+    $rows = @(Get-Content -LiteralPath $Path -ErrorAction Stop | Select-Object -Skip 1 | ConvertFrom-Csv -Header $headers | Where-Object { $_.'Policy Target' -eq 'System' })
+    if ($rows.Count -eq 0) { throw "No system audit subcategories found in $Path. Policy was not verified." }
+    $seen = @{}
+    foreach ($row in $rows) {
+        $guid = [guid]::Empty
+        if (-not [guid]::TryParse($row.'Subcategory GUID', [ref]$guid) -or
+            $row.'Setting Value' -notmatch '^[0-3]$' -or $seen.ContainsKey($guid.ToString())) {
+            throw "Invalid or duplicate audit policy row in $Path."
+        }
+        $seen[$guid.ToString()] = $true
+    }
+    $rows
+}
+
+function Assert-AuditPolicy {
+    param([object[]]$Expected, [object[]]$Actual, [string]$Store)
+    if (-not $Expected.Count -or -not $Actual.Count) { throw "Empty audit policy in $Store." }
+    foreach ($row in $Expected) {
+        $found = @($Actual | Where-Object { [guid]$_.'Subcategory GUID' -eq [guid]$row.'Subcategory GUID' })
+        if ($found.Count -ne 1 -or $found[0].'Setting Value' -ne $row.'Setting Value') {
+            throw "Audit verification failed in ${Store}: $($row.Subcategory) ($($row.'Subcategory GUID')). Another policy may override local settings."
+        }
+    }
+}
+
+function Assert-FirewallProfiles {
+    param([object[]]$Profiles, [string]$Store)
+    foreach ($name in 'Domain', 'Private', 'Public') {
+        $profile = @($Profiles | Where-Object { $_.Name -eq $name })
+        if ($profile.Count -ne 1 -or [string]$profile[0].Enabled -ne 'True' -or
+            [string]$profile[0].DefaultInboundAction -ne 'Block' -or
+            [string]$profile[0].DefaultOutboundAction -ne 'Allow' -or
+            [string]$profile[0].LogBlocked -ne 'True' -or [string]$profile[0].LogAllowed -ne 'True' -or
+            $profile[0].LogMaxSizeKilobytes -lt 16384) {
+            throw "Firewall verification failed for $name in $Store. Another Group Policy may override local settings."
+        }
+    }
+}
+
 function Remove-RegValue {
     param([string]$Path, [string]$Name)
     try { if (Test-Path -LiteralPath $Path) { Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue } } catch {}
@@ -304,27 +394,41 @@ function Set-LockoutPolicy {
 # 6  Firewall   (CIS 9)
 # =====================================================================
 function Enable-WindowsFirewall {
-    Write-Section "6) Windows Defender Firewall (CIS 9)"
+    Write-Section "6) Windows Defender Firewall - local Group Policy and effective settings"
     try {
-        Set-Service -Name mpssvc -StartupType Automatic -ErrorAction SilentlyContinue
-        Set-Service -Name BFE -StartupType Automatic -ErrorAction SilentlyContinue
-        Start-Service -Name BFE -ErrorAction SilentlyContinue
-        Start-Service -Name mpssvc -ErrorAction SilentlyContinue
-
-        foreach ($p in 'Domain', 'Private', 'Public') {
-            Set-NetFirewallProfile -Profile $p -Enabled True `
-                -DefaultInboundAction Block -DefaultOutboundAction Allow `
-                -NotifyOnListen $(if ($p -eq 'Public') { 'False' } else { 'True' }) `
-                -LogFileName "%SystemRoot%\System32\logfiles\firewall\$($p.ToLower())fw.log" `
-                -LogMaxSizeKilobytes 16384 -LogBlocked True -LogAllowed True
+        foreach ($service in 'BFE', 'mpssvc') {
+            $state = Get-Service -Name $service -ErrorAction Stop
+            if ($state.StartType -eq 'Disabled') {
+                Set-Service -Name $service -StartupType Automatic -ErrorAction Stop
+            }
+            if ($state.Status -ne 'Running') {
+                Start-Service -Name $service -ErrorAction Stop
+            }
         }
-        # Common risky inbound rule groups
-        foreach ($g in 'Remote Assistance', 'Windows Remote Management', 'Windows Remote Management (Compatibility)', 'Telnet Server') {
-            Disable-NetFirewallRule -DisplayGroup $g -ErrorAction SilentlyContinue
+        $backup = Join-Path $script:LogDir ('FirewallPolicy-' + [guid]::NewGuid() + '.clixml')
+        Get-NetFirewallProfile -PolicyStore localhost -ErrorAction Stop | Export-Clixml -LiteralPath $backup -ErrorAction Stop
+        Write-Host "Previous local GPO firewall profiles backed up to $backup"
+        # localhost writes the Local Group Policy Object displayed by gpedit;
+        # PersistentStore also configures the local non-GPO firewall settings.
+        foreach ($store in 'localhost', 'PersistentStore') {
+            foreach ($name in 'Domain', 'Private', 'Public') {
+                Set-NetFirewallProfile -PolicyStore $store -Profile $name -Enabled True `
+                    -DefaultInboundAction Block -DefaultOutboundAction Allow `
+                    -NotifyOnListen $(if ($name -eq 'Public') { 'False' } else { 'True' }) `
+                    -LogFileName "%SystemRoot%\System32\logfiles\firewall\$($name.ToLower())fw.log" `
+                    -LogMaxSizeKilobytes 16384 -LogBlocked True -LogAllowed True -ErrorAction Stop
+            }
         }
-        Write-Ok "Firewall on for Domain/Private/Public: inbound blocked, logging enabled."
+        Invoke-NativeCommand -FilePath gpupdate.exe -ArgumentList @('/target:computer', '/force', '/wait:60') | Out-Null
+        Assert-FirewallProfiles -Profiles @(Get-NetFirewallProfile -PolicyStore localhost -ErrorAction Stop) -Store 'Local Group Policy'
+        Assert-FirewallProfiles -Profiles @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop) -Store 'effective policy'
+        foreach ($group in 'Remote Assistance', 'Windows Remote Management', 'Windows Remote Management (Compatibility)', 'Telnet Server') {
+            Disable-NetFirewallRule -DisplayGroup $group -ErrorAction SilentlyContinue
+        }
+        Write-Ok 'Verified local GPO and effective firewall profiles: Domain/Private/Public ON, inbound Block, outbound Allow, logging enabled.'
+        Write-Host 'Close and reopen the Local Group Policy editor to refresh its displayed values.'
     }
-    catch { Write-Bad "Error configuring firewall: $_" }
+    catch { Write-Bad "Firewall configuration or verification failed: $_" }
     Wait-Key
 }
 
@@ -587,15 +691,80 @@ function Set-SecurityOptions {
 # 13  Audit policy   (CIS 17)
 # =====================================================================
 function Enable-Auditing {
+    param([guid[]]$SubcategoryGuid = @())
     $regBefore = $script:RegFail
-    Write-Section "13) Advanced audit policy (CIS 17)"
+    Write-Section "13) Advanced audit policy - local Group Policy and effective settings"
     try {
+        $lgpo = Get-LgpoExecutable
+        $work = Join-Path $script:LogDir ('AuditPolicy-' + [guid]::NewGuid())
+        $null = [IO.Directory]::CreateDirectory($work)
+        $backup = Join-Path $work 'LocalGpoBackup'
+        $null = [IO.Directory]::CreateDirectory($backup)
+        Invoke-NativeCommand -FilePath $lgpo -ArgumentList @('/b', $backup, '/n', 'Before CyberPatriot audit configuration') | Out-Null
+        $before = Join-Path $work 'audit-before.csv'
+        Invoke-NativeCommand -FilePath auditpol.exe -ArgumentList @('/backup', "/file:$before") | Out-Null
+        $current = @(Read-SystemAuditPolicy -Path $before)
+        foreach ($guid in $SubcategoryGuid) {
+            if (@($current | Where-Object { [guid]$_.'Subcategory GUID' -eq $guid }).Count -ne 1) {
+                throw "Windows did not report audit subcategory $guid. No audit settings were changed."
+            }
+        }
+        # Use Windows' own subcategory GUIDs, not localized display names. This
+        # preserves the existing all-subcategories Success+Failure behavior.
+        $desired = @($current | ForEach-Object {
+            $selected = $SubcategoryGuid.Count -eq 0 -or $SubcategoryGuid -contains [guid]$_.'Subcategory GUID'
+            [pscustomobject][ordered]@{
+                'Machine Name' = ''
+                'Policy Target' = 'System'
+                'Subcategory' = $_.Subcategory
+                'Subcategory GUID' = $_.'Subcategory GUID'
+                'Inclusion Setting' = if ($selected) { 'Success and Failure' } else { $_.'Inclusion Setting' }
+                'Exclusion Setting' = ''
+                'Setting Value' = if ($selected) { '3' } else { $_.'Setting Value' }
+            }
+        })
+        $csv = Join-Path $work 'audit-desired.csv'
+        $desired | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        $registryPolicy = Join-Path $work 'audit-registry.txt'
+        @'
+Computer
+SYSTEM\CurrentControlSet\Control\Lsa
+SCENoApplyLegacyAuditPolicy
+DWORD:1
+
+Computer
+SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit
+ProcessCreationIncludeCmdLine_Enabled
+DWORD:1
+
+'@ | Set-Content -LiteralPath $registryPolicy -Encoding Unicode -ErrorAction Stop
         Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1
-        Invoke-NativeCommand -FilePath auditpol.exe -ArgumentList @('/set', '/category:*', '/success:enable', '/failure:enable') | Out-Null
         Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' 'ProcessCreationIncludeCmdLine_Enabled' 1
-        Write-RegistryResult -Before $regBefore -SuccessMessage "Success+Failure auditing enabled for every audit category (superset of the CIS audit list)."
+        if ($script:RegFail -gt $regBefore) { throw 'Required audit registry settings could not be written.' }
+        # LGPO merges these entries into Registry.pol and registers the audit
+        # client-side extension; auditpol alone does not configure the GPO UI.
+        Invoke-NativeCommand -FilePath $lgpo -ArgumentList @('/t', $registryPolicy, '/a', $csv) | Out-Null
+        Invoke-NativeCommand -FilePath gpupdate.exe -ArgumentList @('/target:computer', '/force', '/wait:60') | Out-Null
+        $persisted = Join-Path $env:SystemRoot 'System32\GroupPolicy\Machine\Microsoft\Windows NT\Audit\audit.csv'
+        Assert-AuditPolicy -Expected $desired -Actual @(Read-SystemAuditPolicy -Path $persisted) -Store 'Local Group Policy'
+        $effective = Join-Path $work 'audit-effective.csv'
+        Invoke-NativeCommand -FilePath auditpol.exe -ArgumentList @('/backup', "/file:$effective") | Out-Null
+        Assert-AuditPolicy -Expected $desired -Actual @(Read-SystemAuditPolicy -Path $effective) -Store 'effective audit policy'
+        foreach ($setting in @(
+            @('HKLM:\SYSTEM\CurrentControlSet\Control\Lsa', 'SCENoApplyLegacyAuditPolicy'),
+            @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit', 'ProcessCreationIncludeCmdLine_Enabled')
+        )) {
+            if ((Get-ItemProperty -LiteralPath $setting[0] -Name $setting[1] -ErrorAction Stop).($setting[1]) -ne 1) {
+                throw "Required audit setting was overridden: $($setting[1])"
+            }
+        }
+        $selectedCount = if ($SubcategoryGuid.Count) { $SubcategoryGuid.Count } else { $desired.Count }
+        Write-Ok "Verified $selectedCount requested advanced audit subcategories in local GPO and effective policy: Success and Failure."
+        Write-Host "Policy backups and verification CSVs: $work"
+        Write-Host 'Close and reopen secpol.msc/gpedit.msc to refresh the displayed configuration.'
+        Write-Host 'Global Object Access Auditing SACLs are separate and were left unchanged.'
     }
-    catch { Write-Bad "Error enabling auditing: $_" }
+    catch { Write-Bad "Advanced audit configuration or verification failed: $_" }
     Wait-Key
 }
 
@@ -1305,6 +1474,7 @@ function Invoke-ReadmeAudit {
         if ($adminList.Count -eq 0 -and $userList.Count -eq 0) { Write-Warn "No lists provided."; Wait-Key; return }
     }
 
+    $script:WarriorReadmePlan = [pscustomobject]@{Source=$file; Admins=@($adminList); Users=@($adminList)+@($userList)}
     $authAdmin = @($adminList | ForEach-Object { $_.ToLower() })
     $authAll = @($authAdmin) + @($userList | ForEach-Object { $_.ToLower() })
     $me = $script:CurrentUserName.ToLower()
@@ -1445,20 +1615,30 @@ function Show-Menu {
         @('19) Defender hardening', '20) Network/features/shares'),
         @('21) User rights (CIS 2.2)', '22) Recon / forensics helpers'),
         @('88) RUN EVERYTHING', '70) Reboot'),
-        @('23) README user/admin audit', '69) Exit')
+        @('23) README user/admin audit', '24) Windows Warrior walkthrough'),
+        @('25) Global object auditing (opt-in)', '69) Exit')
     )
     foreach ($r in $rows) { Write-Host ("{0,-38}{1}" -f $r[0], $r[1]) }
     Write-Host $line -ForegroundColor Cyan
 }
 
+# Optional guided tutorial companion: download/extract the complete repository.
+$walkthrough = Join-Path $PSScriptRoot 'Windows-Warrior.ps1'
+if (Test-Path -LiteralPath $walkthrough -PathType Leaf) { . $walkthrough }
+else { Write-Warn 'For options 24/25, download the complete repository including Windows-Warrior.ps1.' }
+
 # Initial prompt
 Clear-Host
 $answer = Read-Host "Have you answered all the forensics questions? [y/n]"
 if ($answer -ne 'y') {
-    Write-Warn "Please go and answer them."
-    pause
-    try { Stop-Transcript | Out-Null } catch {}
-    exit
+    if ((Get-Command Invoke-WarriorForensics -ErrorAction SilentlyContinue) -and
+        (Confirm-Action 'Open the read-only Windows Warrior forensics helpers first?' $true)) {
+        Invoke-WarriorForensics
+    }
+    if (-not (Confirm-Action 'Have you saved your forensics answers and are you ready to start hardening?' $false)) {
+        try { Stop-Transcript | Out-Null } catch {}
+        exit
+    }
 }
 
 do {
@@ -1489,6 +1669,8 @@ do {
             '21' { Set-UserRights }
             '22' { Invoke-Recon }
             '23' { Invoke-ReadmeAudit }
+            '24' { Invoke-WindowsWarrior }
+            '25' { Set-GlobalObjectAuditing }
             '88' { Invoke-Everything }
             '69' { try { Stop-Transcript | Out-Null } catch {}; exit }
             '70' { try { Stop-Transcript | Out-Null } catch {}; Restart-Computer -Force }

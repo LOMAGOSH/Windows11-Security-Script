@@ -17,6 +17,9 @@ foreach ($node in $ast.EndBlock.Statements) {
 }
 $realRegistryWriter = ${function:Set-RegistryValue}
 $realNativeRunner = ${function:Invoke-NativeCommand}
+$script:auditFixture = @('0cce923f', '0cce9240', '0cce9241', '0cce9242') | ForEach-Object {
+    [pscustomobject][ordered]@{'Machine Name'='PC'; 'Policy Target'='System'; Subcategory='Localized name'; 'Subcategory GUID'='{'+$_+'-69ae-11d9-bed3-505054503030}'; 'Inclusion Setting'='No Auditing'; 'Exclusion Setting'=''; 'Setting Value'='0'}
+}
 $script:passed = 0
 function Assert-True($Condition, [string]$Message) {
     if (-not $Condition) { throw "FAILED: $Message" }
@@ -123,21 +126,76 @@ function Set-RegistryValue {
     if ($Name -eq $script:failRegistryName) { $script:RegFail++; Write-Bad "Simulated failure: $Name"; return }
     $script:writes.Add([pscustomobject]@{Path = $Path; Name = $Name; Value = $Value; Type = $Type})
 }
+function Get-LgpoExecutable { return 'LGPO.exe' }
+function Get-ItemProperty {
+    [CmdletBinding()]
+    param($LiteralPath, $Name)
+    $value = if ($script:overrideAuditRegistry) { 0 } else { 1 }
+    [pscustomobject]@{ $Name = $value }
+}
 function Invoke-NativeCommand {
     [CmdletBinding()]
     param([string]$FilePath, [string[]]$ArgumentList)
     $script:nativeCalls.Add([pscustomobject]@{FilePath = $FilePath; Arguments = $ArgumentList})
     if ($FilePath -eq $script:failNative) { throw "Simulated $FilePath failure (exit code 5)" }
+    if ($FilePath -eq 'auditpol.exe' -and $ArgumentList[0] -eq '/backup') {
+        $csvPath = $ArgumentList[1].Substring(6)
+        $rows = if ($csvPath -like '*audit-before.csv') { $script:auditFixture } else { $script:effectiveAudit }
+        if ($script:overrideEffectiveAudit -and $csvPath -like '*audit-effective.csv') { $rows = $script:auditFixture }
+        $rows | Export-Csv -LiteralPath $csvPath -Encoding UTF8 -NoTypeInformation
+    }
+    if ($FilePath -eq 'LGPO.exe' -and $ArgumentList -contains '/a') {
+        $csvPath = $ArgumentList[[array]::IndexOf($ArgumentList, '/a') + 1]
+        $script:effectiveAudit = @(Import-Csv -LiteralPath $csvPath)
+        if (-not $script:missingLocalAudit) {
+            $localPath = Join-Path $env:SystemRoot 'System32/GroupPolicy/Machine/Microsoft/Windows NT/Audit/audit.csv'
+            $null = [IO.Directory]::CreateDirectory((Split-Path -Parent $localPath))
+            $script:effectiveAudit | Export-Csv -LiteralPath $localPath -Encoding UTF8 -NoTypeInformation
+        }
+    }
 }
+$script:firewall = @{}
+function Get-Service {
+    [CmdletBinding()]
+    param($Name)
+    [pscustomobject]@{Status='Running'; StartType='Automatic'}
+}
+function Get-NetFirewallProfile {
+    [CmdletBinding()]
+    param($PolicyStore)
+    $lookup = if ($PolicyStore -eq 'ActiveStore') { 'localhost' } else { $PolicyStore }
+    foreach ($name in 'Domain', 'Private', 'Public') {
+        $key = "$lookup|$name"
+        if (-not $script:firewall.ContainsKey($key)) {
+            $script:firewall[$key] = [pscustomobject]@{Name=$name; Enabled='NotConfigured'; DefaultInboundAction='NotConfigured'; DefaultOutboundAction='NotConfigured'; LogBlocked='NotConfigured'; LogAllowed='NotConfigured'; LogMaxSizeKilobytes=4096}
+        }
+        $profile = $script:firewall[$key] | Select-Object *
+        if ($script:overrideEffectiveFirewall -and $PolicyStore -eq 'ActiveStore') { $profile.Enabled = 'False' }
+        $profile
+    }
+}
+function Set-NetFirewallProfile {
+    [CmdletBinding()]
+    param($PolicyStore, $Profile, $Enabled, $DefaultInboundAction, $DefaultOutboundAction, $NotifyOnListen, $LogFileName, $LogMaxSizeKilobytes, $LogBlocked, $LogAllowed)
+    if ($script:failFirewallWrite) { throw 'Firewall policy store is read-only' }
+    $script:firewall["$PolicyStore|$Profile"] = [pscustomobject]@{Name=$Profile; Enabled=$Enabled; DefaultInboundAction=$DefaultInboundAction; DefaultOutboundAction=$DefaultOutboundAction; LogBlocked=$LogBlocked; LogAllowed=$LogAllowed; LogMaxSizeKilobytes=$LogMaxSizeKilobytes}
+}
+function Disable-NetFirewallRule { param($DisplayGroup, $ErrorAction) }
 function Reset-Records {
     $script:writes.Clear(); $script:nativeCalls.Clear(); $script:good.Clear(); $script:bad.Clear()
     $script:failNative = ''; $script:failRegistryName = ''
+    $script:overrideEffectiveAudit = $false; $script:overrideAuditRegistry = $false; $script:missingLocalAudit = $false
+    $script:overrideEffectiveFirewall = $false; $script:failFirewallWrite = $false; $script:firewall = @{}
+    $localPath = Join-Path $env:SystemRoot 'System32/GroupPolicy/Machine/Microsoft/Windows NT/Audit/audit.csv'
+    if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $localPath) { Remove-Item -LiteralPath $localPath }
 }
 function Read-Host { param([string]$Prompt) return '' }
 $oldTemp = $env:TEMP
+$oldSystemRoot = $env:SystemRoot
 $testTemp = Join-Path ([IO.Path]::GetTempPath()) ('cp-tests-' + [guid]::NewGuid())
 $null = [IO.Directory]::CreateDirectory($testTemp)
 $env:TEMP = $testTemp
+$env:SystemRoot = Join-Path $testTemp 'Windows'
 $PwHistory = 24; $PwMaxAge = 60; $PwMinAge = 1; $PwMinLen = 14
 $LockThreshold = 5; $LockDuration = 30; $LockWindow = 30
 $script:LogDir = $testTemp; $script:Stamp = 'test'
@@ -193,18 +251,88 @@ try {
         Assert-True (@($script:writes | Where-Object Type -eq 'Binary').Count -eq 1) 'Binary security setting dispatched'
         Assert-True ($script:bad.Count -eq 0) 'No binding or native errors'
     }
-    Test-Case 'Option 13 applies both audit registry settings and auditpol' {
+    Test-Case 'Option 6 saves all firewall profiles in both stores and verifies effective policy' {
+        Reset-Records
+        Enable-WindowsFirewall
+        Assert-True ($script:firewall.Count -eq 6) 'Three profiles written to local GPO and PersistentStore'
+        Assert-True ($script:nativeCalls[0].FilePath -eq 'gpupdate.exe') 'Group Policy refreshed'
+        Assert-True ($script:good.Count -eq 1 -and $script:bad.Count -eq 0) 'Stored and effective profiles agree'
+    }
+    Test-Case 'Option 6 reports an effective firewall override instead of success' {
+        Reset-Records; $script:overrideEffectiveFirewall = $true
+        Enable-WindowsFirewall
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Overriding policy detected'
+    }
+    Test-Case 'Option 6 does not report success after a policy write failure' {
+        Reset-Records; $script:failFirewallWrite = $true
+        Enable-WindowsFirewall
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Read-only store failure reported'
+    }
+    Test-Case 'Option 13 persists advanced auditing by GUID in local GPO and verifies effective policy' {
         Reset-Records
         Enable-Auditing
-        Assert-True ($script:writes.Count -eq 2) 'Both audit registry settings dispatched'
-        Assert-True ($script:nativeCalls[0].FilePath -eq 'auditpol.exe') 'Auditpol invoked'
-        Assert-True ($script:good.Count -eq 1 -and $script:bad.Count -eq 0) 'Successful audit result'
+        Assert-True ($script:writes.Count -eq 2) 'Both audit registry settings applied'
+        Assert-True (@($script:nativeCalls | Where-Object { $_.FilePath -eq 'LGPO.exe' -and $_.Arguments -contains '/b' }).Count -eq 1) 'Local GPO backed up'
+        Assert-True (@($script:nativeCalls | Where-Object { $_.FilePath -eq 'LGPO.exe' -and $_.Arguments -contains '/t' -and $_.Arguments -contains '/a' }).Count -eq 1) 'Registry.pol and audit policy imported'
+        Assert-True ($script:effectiveAudit.Count -eq 4 -and @($script:effectiveAudit | Where-Object { $_.'Setting Value' -ne '3' }).Count -eq 0) 'All discovered subcategories enabled'
+        Assert-True ($script:good.Count -eq 1 -and $script:bad.Count -eq 0) 'Verified audit result'
     }
-    Test-Case 'Option 13 reports auditpol failure without a success message' {
+    Test-Case 'Option 13 stops before changes when the audit backup fails' {
         Reset-Records; $script:failNative = 'auditpol.exe'
         Enable-Auditing
-        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Audit failure visible'
-        Assert-True ($script:writes.Count -eq 1) 'Stops after failed native command'
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Audit backup failure visible'
+        Assert-True ($script:writes.Count -eq 0) 'No configuration changes after failed backup'
+    }
+    Test-Case 'Option 13 detects runtime-only audit changes with no local GPO file' {
+        Reset-Records; $script:missingLocalAudit = $true
+        Enable-Auditing
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Missing persistent policy detected'
+    }
+    Test-Case 'Option 13 detects effective audit settings overridden after refresh' {
+        Reset-Records; $script:overrideEffectiveAudit = $true
+        Enable-Auditing
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Effective mismatch detected'
+    }
+    Test-Case 'Option 13 detects required registry settings overridden after refresh' {
+        Reset-Records; $script:overrideAuditRegistry = $true
+        Enable-Auditing
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Required audit override detected'
+    }
+    Test-Case 'Option 13 refuses to continue without the signed LGPO prerequisite' {
+        Reset-Records
+        function Get-LgpoExecutable { throw 'Microsoft signature invalid' }
+        Enable-Auditing
+        Assert-True ($script:nativeCalls.Count -eq 0 -and $script:writes.Count -eq 0) 'No changes without prerequisite'
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Missing prerequisite visible'
+    }
+    Test-Case 'An individual walkthrough audit step preserves unrelated subcategory settings' {
+        Reset-Records
+        Enable-Auditing -SubcategoryGuid '0cce923f-69ae-11d9-bed3-505054503030'
+        Assert-True ($script:good.Count -eq 1 -and $script:bad.Count -eq 0) 'Targeted audit policy verified'
+        Assert-True (@($script:effectiveAudit | Where-Object { $_.'Setting Value' -eq '3' }).Count -eq 1) 'Only the requested subcategory enabled'
+    }
+    Test-Case 'Localized audit CSV headers normalize to the documented seven columns' {
+        $path = Join-Path $testTemp 'localized.csv'
+        $csv = @($script:auditFixture | ConvertTo-Csv -NoTypeInformation)
+        $csv[0] = '"Ordinateur","Cible","Sous-categorie","GUID","Inclusion","Exclusion","Valeur"'
+        $csv | Set-Content -LiteralPath $path -Encoding UTF8
+        $rows = @(Read-SystemAuditPolicy -Path $path)
+        Assert-True ($rows.Count -eq 4 -and $rows[0].'Setting Value' -eq '0') 'Localized headers do not lose policy rows'
+    }
+    Test-Case 'LGPO signature check accepts Microsoft and rejects unsigned or other publishers' {
+        $script:fakeSignature = [pscustomobject]@{Status='Valid'; SignerCertificate=[pscustomobject]@{Subject='CN=Microsoft Corporation, O=Microsoft Corporation, C=US'}}
+        function Get-AuthenticodeSignature { param($FilePath, $ErrorAction) $script:fakeSignature }
+        Assert-MicrosoftLgpoSignature -Path 'LGPO.exe'
+        foreach ($signature in @(
+            [pscustomobject]@{Status='NotSigned'; SignerCertificate=$null},
+            [pscustomobject]@{Status='HashMismatch'; SignerCertificate=[pscustomobject]@{Subject='O=Microsoft Corporation'}},
+            [pscustomobject]@{Status='Valid'; SignerCertificate=[pscustomobject]@{Subject='O=Other Publisher'}}
+        )) {
+            $script:fakeSignature = $signature
+            $caught = $false
+            try { Assert-MicrosoftLgpoSignature -Path 'LGPO.exe' } catch { $caught = $true }
+            Assert-True $caught 'Invalid or wrong-publisher executable rejected'
+        }
     }
     Test-Case 'Option 15 handles every advanced registry call including UNC names' {
         Reset-Records
@@ -265,11 +393,12 @@ try {
 }
 finally {
     $env:TEMP = $oldTemp
+    $env:SystemRoot = $oldSystemRoot
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $testTemp -Recurse -Force
 }
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-    Remove-Item Function:\Test-Path, Function:\New-Item, Function:\New-ItemProperty
+    Remove-Item Function:\Test-Path, Function:\New-Item, Function:\New-ItemProperty, Function:\Get-ItemProperty
     ${function:Set-RegistryValue} = $realRegistryWriter
     Test-Case 'Windows registry integration: DWORD, string, binary and empty REG_MULTI_SZ read back correctly' {
         $key = 'HKCU:\Software\CyberPatriot-Hardening-Tests\' + [guid]::NewGuid()
