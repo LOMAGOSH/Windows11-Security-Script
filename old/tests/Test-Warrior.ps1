@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 # Imports declarations only. Every Windows command is replaced before actions run.
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
-foreach ($name in 'CyberPatriot-Win11-Hardening.ps1','Windows-Warrior.ps1') {
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+foreach ($name in 'LOMAGOSH-Windows11.ps1') {
     $tokens = $null; $errors = $null
     $tree = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root $name),[ref]$tokens,[ref]$errors)
     if ($errors.Count) { throw ($errors | Out-String) }

@@ -5,8 +5,8 @@ launcher, menu, or hardening actions. Windows operations are replaced with fakes
 On Windows, also tests the real registry writer in a temporary HKCU test key.
 #>
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
-$toolkit = Join-Path $root 'CyberPatriot-Win11-Hardening.ps1'
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$toolkit = Join-Path $root 'LOMAGOSH-Windows11.ps1'
 $tokens = $null; $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($toolkit, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
@@ -15,10 +15,6 @@ foreach ($node in $ast.EndBlock.Statements) {
         . ([scriptblock]::Create($node.Extent.Text))
     }
 }
-$policyTokens=$null;$policyErrors=$null
-$policyAst=[System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'Windows-Policy.ps1'),[ref]$policyTokens,[ref]$policyErrors)
-if($policyErrors.Count){throw ($policyErrors | Out-String)}
-foreach($node in $policyAst.EndBlock.Statements){if($node -is [System.Management.Automation.Language.FunctionDefinitionAst]){. ([scriptblock]::Create($node.Extent.Text))}}
 $realRegistryWriter = ${function:Set-RegistryValue}
 $realNativeRunner = ${function:Invoke-NativeCommand}
 $script:auditFixture = @('0cce923f', '0cce9240', '0cce9241', '0cce9242') | ForEach-Object {

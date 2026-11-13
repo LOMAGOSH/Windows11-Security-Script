@@ -1,3 +1,9 @@
+# Archived files
+
+Use the two standalone **LOMAGOSH by Jasiah O** scripts at the repository root.
+Files below are preserved for history and are not runtime dependencies. Tests in
+`old/tests` validate the current standalone scripts.
+
 # Windows11-Security-Script
 
 Download the repository ZIP and extract it, keeping the files together. Double-click

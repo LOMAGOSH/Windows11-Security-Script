@@ -122,6 +122,7 @@ function Stop-WarriorService {
     param([string]$Name)
     $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $service) { Write-Host "$Name is already absent."; return }
+    Assert-ServiceCanStop $Name
     if ($service.Status -ne 'Stopped') { Stop-Service -Name $Name -Force -ErrorAction Stop }
     Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
 }
@@ -177,6 +178,7 @@ function Move-WarriorEvidenceFile {
 
 function Invoke-WarriorTaskAction {
     param([ValidateRange(1,50)][int]$Id)
+    if((Test-ToolkitDomainController) -and ($Id -in 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)){throw 'Use option 26 for AD accounts/domain password policy on a domain controller.'}
     $lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
     $system = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
     switch ($Id) {
@@ -303,6 +305,7 @@ function Invoke-WarriorTaskAction {
         }
         50 {
             $target = Get-WarriorTarget 'Exact share name declared unauthorized by this image'
+            if($target -in 'SYSVOL','NETLOGON'){throw 'Required domain shares cannot be removed by this workflow.'}
             $share = Get-SmbShare -ErrorAction Stop | Where-Object Name -eq $target
             if ($share) {
                 $share | Export-Clixml -LiteralPath (Join-Path $script:LogDir ('Removed-share-' + [guid]::NewGuid() + '.clixml')) -ErrorAction Stop
@@ -464,6 +467,7 @@ function Invoke-WarriorForensics {
 }
 
 function Invoke-ImageGroupPlan {
+    if(Test-ToolkitDomainController){Invoke-ServerAdGroupPlan;return}
     Write-Section 'Current image - group membership plan'
     $name = Get-WarriorTarget 'Exact local group required by the current README'
     $members = @((Read-Host 'Authorized local usernames for this group, comma separated') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)

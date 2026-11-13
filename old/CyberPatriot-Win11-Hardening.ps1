@@ -98,6 +98,7 @@ $script:Auto = $false
 $script:RegFail = 0
 $script:FailureCount = 0
 $script:CurrentUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]
+$script:CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
 $desktop = [Environment]::GetFolderPath('Desktop')
 $script:LogDir = if ($desktop -and (Test-Path $desktop)) { $desktop } else { $env:TEMP }
@@ -235,6 +236,7 @@ function Get-OSLabel {
 # 1  User properties
 # =====================================================================
 function Set-UserProperties {
+    Assert-LocalAccountWorkflow
     Write-Section "1) Setting password properties for all enabled local users"
     foreach ($u in (Get-LocalUser | Where-Object { $_.Enabled })) {
         try {
@@ -258,11 +260,14 @@ function Set-UserProperties {
 # 2  Change all passwords
 # =====================================================================
 function Set-AllPasswords {
+    if(Test-ToolkitDomainController){Reset-ApprovedServerPasswords;return}
+    Assert-LocalAccountWorkflow
     Write-Section "2) Change all passwords"
     Write-Host 'Using the configured default password for enabled local accounts. No password entry is needed.'
     $sec = Get-DefaultAccountPassword
     $skipSelf = -not (Confirm-Action "Also change the password of YOUR current account ($($script:CurrentUserName))?" $true)
     foreach ($u in (Get-LocalUser | Where-Object { $_.Enabled })) {
+        if(Test-PasswordProtectedAccount $u.Name){Write-Warn "Skipped protected auto-login account $($u.Name).";continue}
         if ($skipSelf -and $u.Name -eq $script:CurrentUserName) { Write-Warn "Skipped current account $($u.Name)"; continue }
         try {
             Set-LocalUser -Name $u.Name -Password $sec -ErrorAction Stop
@@ -277,6 +282,8 @@ function Set-AllPasswords {
 # 3  Disable Guest / built-in Administrator
 # =====================================================================
 function Disable-GuestAdmin {
+    if(Test-ToolkitDomainController){Disable-ServerBuiltinAccounts;return}
+    Assert-LocalAccountWorkflow
     $regBefore = $script:RegFail
     Write-Section "3) Disable Guest and built-in Administrator"
     $guest = Get-LocalUser | Where-Object { $_.SID.Value -like '*-501' }
@@ -298,6 +305,7 @@ function Disable-GuestAdmin {
 # 4  Password policy   (CIS 1.1)
 # =====================================================================
 function Set-PasswordPolicy {
+    if(Test-ToolkitDomainController){Set-ServerDomainAccountPolicy -Part Password;return}
     Write-Section "4) Apply and verify password policy"
     $regBefore=$script:RegFail
     try {
@@ -324,6 +332,7 @@ function Set-PasswordPolicy {
 # 5  Lockout policy   (CIS 1.2)
 # =====================================================================
 function Set-LockoutPolicy {
+    if(Test-ToolkitDomainController){Set-ServerDomainAccountPolicy -Part Lockout;return}
     Write-Section "5) Apply and verify account lockout policy"
     try {
         if($LockThreshold -lt 1 -or $LockThreshold -gt 999 -or $LockWindow -lt 1 -or $LockDuration -lt $LockWindow -or $LockDuration -gt 99999) {
@@ -347,6 +356,7 @@ function Set-LockoutPolicy {
 # 6  Firewall   (CIS 9)
 # =====================================================================
 function Enable-WindowsFirewall {
+    if(Test-ToolkitServer){Enable-ServerFirewall;return}
     Write-Section "6) Windows Defender Firewall - local Group Policy and effective settings"
     try {
         foreach ($service in 'BFE', 'mpssvc') {
@@ -375,8 +385,10 @@ function Enable-WindowsFirewall {
         Invoke-NativeCommand -FilePath gpupdate.exe -ArgumentList @('/target:computer', '/force', '/wait:60') | Out-Null
         Assert-FirewallProfiles -Profiles @(Get-NetFirewallProfile -PolicyStore localhost -ErrorAction Stop) -Store 'Local Group Policy'
         Assert-FirewallProfiles -Profiles @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop) -Store 'effective policy'
+        if(-not (Test-ToolkitServer)){
         foreach ($group in 'Remote Assistance', 'Windows Remote Management', 'Windows Remote Management (Compatibility)', 'Telnet Server') {
             Disable-NetFirewallRule -DisplayGroup $group -ErrorAction SilentlyContinue
+        }
         }
         Write-Ok 'Verified local GPO and effective firewall profiles: Domain/Private/Public ON, inbound Block, outbound Allow, logging enabled.'
         Write-Host 'Close and reopen the Local Group Policy editor to refresh its displayed values.'
@@ -423,6 +435,7 @@ function Search-MediaFiles {
 # 8  Disable services   (CIS 5)
 # =====================================================================
 function Disable-UnnecessaryServices {
+    if(Test-ToolkitServer){Invoke-ServiceManager;return}
     Write-Section "8) Disable unnecessary services (CIS 5)"
     $core = @('RemoteRegistry', 'SSDPSRV', 'upnphost', 'WerSvc', 'XboxNetApiSvc', 'XblAuthManager', 'XblGameSave', 'XboxGipSvc',
         'WMPNetworkSvc', 'bthserv', 'BTAGService', 'AJRouter', 'MapsBroker', 'lfsvc', 'SharedAccess', 'Fax', 'Wecsvc', 'irmon',
@@ -435,6 +448,7 @@ function Disable-UnnecessaryServices {
         $svc = Get-Service -Name $n -ErrorAction SilentlyContinue
         if ($svc) {
             try {
+                Assert-ServiceCanStop $n
                 Stop-Service -Name $n -Force -ErrorAction SilentlyContinue
                 Set-Service -Name $n -StartupType Disabled -ErrorAction Stop
                 Write-Ok "Disabled: $n"
@@ -490,6 +504,8 @@ function Set-RemoteDesktop {
     $TSP = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
     $a = Read-Host "[D]isable Remote Desktop, [H]arden it but keep it ON (README requires RDP), or [S]kip? (D/H/S)"
     if ($a -match '^[dD]') {
+        $blocked=Get-ServerServiceBlockReason TermService
+        if($blocked){throw "RDP disable blocked: $blocked"}
         Set-RegistryValue $TS 'fDenyTSConnections' 1
         Set-RegistryValue $TSP 'fDenyTSConnections' 1
         Disable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
@@ -531,11 +547,13 @@ function Enable-AutoUpdate {
     Set-RegistryValue $AU 'AUOptions' 4
     Set-RegistryValue $AU 'ScheduledInstallDay' 0
     Set-RegistryValue $AU 'ScheduledInstallTime' 3
-    Set-RegistryValue $AU 'NoAutoRebootWithLoggedOnUsers' 0
+    Set-RegistryValue $AU 'NoAutoRebootWithLoggedOnUsers' $(if(Test-ToolkitServer){1}else{0})
     Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update' 'AUOptions' 4
     Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'AllowMUUpdateService' 1    # other Microsoft products
+    if(-not (Test-ToolkitServer)){
     Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'ManagePreviewBuildsPolicyValue' 1
     Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'BranchReadinessLevel' 16
+    }
     foreach ($n in 'wuauserv', 'bits', 'cryptsvc', 'UsoSvc') {
         try { Set-Service -Name $n -StartupType Automatic -ErrorAction Stop; Start-Service -Name $n -ErrorAction SilentlyContinue } catch {}
     }
@@ -547,6 +565,7 @@ function Enable-AutoUpdate {
 # 12  Security options   (CIS 2.3)
 # =====================================================================
 function Set-SecurityOptions {
+    if(Test-ToolkitServer){Set-ServerRegistryBaseline;return}
     $regBefore = $script:RegFail
     Write-Section "12) Local security options (CIS 2.3)"
     $S = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
@@ -708,6 +727,7 @@ function Enable-Auditing {
 # 14  Users & groups manager
 # =====================================================================
 function Edit-Groups {
+    Assert-LocalAccountWorkflow
     $builtin = 'Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount'
     do {
         Clear-Host
@@ -788,6 +808,7 @@ function Edit-Groups {
 # 15  Advanced security   (CIS 18 - Administrative Templates)
 # =====================================================================
 function Set-AdvancedSecurity {
+    if(Test-ToolkitServer){Set-ServerRegistryBaseline;Write-Host 'Use option 26 for reviewed server-role settings. Workstation-only templates were not applied.';return}
     $regBefore = $script:RegFail
     Write-Section "15) Advanced security - CIS 18 administrative templates"
     $POL = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows'
@@ -988,6 +1009,7 @@ function Set-ApacheSecurity {
 # 17  Force Windows Updates
 # =====================================================================
 function Invoke-WindowsUpdateForce {
+    if(Test-ToolkitServer){Invoke-ServerWindowsUpdate;return}
     $regBefore = $script:RegFail
     Write-Section "17) Force Windows updates (OS + Microsoft products + Defender signatures)"
     Write-Host (Get-OSLabel)
@@ -1057,8 +1079,10 @@ function Invoke-WindowsUpdateForce {
 # 18  Update apps (winget + Microsoft Store)
 # =====================================================================
 function Update-AllApps {
+    if((Test-ToolkitServer) -and -not (Get-Command winget.exe -ErrorAction SilentlyContinue)){Show-ServerInstalledSoftware;Write-Warn 'Microsoft Store/automatic App Installer deployment is not used on Server 2022. Update required apps using their signed vendor installers.';Wait-Key;return}
     Write-Section "18) Update apps (winget + Microsoft Store)"
-    # Microsoft Store apps
+    # Microsoft Store apps are a workstation workflow.
+    if(-not (Test-ToolkitServer)){
     try {
         Get-CimInstance -Namespace 'root\cimv2\mdm\dmmap' -ClassName 'MDM_EnterpriseModernAppManagement_AppManagement01' -ErrorAction Stop |
             Invoke-CimMethod -MethodName UpdateScanMethod | Out-Null
@@ -1066,6 +1090,7 @@ function Update-AllApps {
     }
     catch { Write-Warn "Store update trigger not available: $($_.Exception.Message)" }
 
+    }
     # winget
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if (-not $winget) {
@@ -1100,6 +1125,10 @@ function Update-AllApps {
 # 19  Defender hardening
 # =====================================================================
 function Set-DefenderHardening {
+    if(Test-ToolkitServer){
+        if(-not (Get-Command Set-MpPreference -ErrorAction SilentlyContinue)){Write-Warn 'Defender management is unavailable on this server; review installed antivirus/Defender roles.';return}
+        if(-not (Confirm-Action 'Apply Defender/ASR settings after checking required server apps and remote management?' $false)){return}
+    }
     $regBefore = $script:RegFail
     Write-Section "19) Microsoft Defender hardening"
     try { Set-Service -Name WinDefend -StartupType Automatic -ErrorAction SilentlyContinue; Start-Service -Name WinDefend -ErrorAction SilentlyContinue } catch {}
@@ -1144,6 +1173,7 @@ function Set-NetworkHardening {
     try { Set-SmbServerConfiguration -EnableSMB1Protocol $false -RequireSecuritySignature $true -EnableSecuritySignature $true -Force -ErrorAction Stop; Write-Ok "SMBv1 off, SMB signing required (server)." } catch { Write-Warn "SMB server config: $($_.Exception.Message)" }
     try { Set-SmbClientConfiguration -RequireSecuritySignature $true -Force -ErrorAction Stop; Write-Ok "SMB signing required (client)." } catch { Write-Warn "SMB client config: $($_.Exception.Message)" }
 
+    if(-not (Test-ToolkitServer)){
     try {
         Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' | ForEach-Object {
             Invoke-CimMethod -InputObject $_ -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]2 } | Out-Null
@@ -1152,6 +1182,7 @@ function Set-NetworkHardening {
     }
     catch { Write-Warn "NetBIOS: $($_.Exception.Message)" }
 
+    } else {Write-Host 'Server NetBIOS/network adapter settings are preserved for role-specific review.'}
     $sch = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
     foreach ($p in 'SSL 2.0', 'SSL 3.0') {
         foreach ($side in 'Server', 'Client') {
@@ -1161,22 +1192,14 @@ function Set-NetworkHardening {
     }
     Write-RegistryResult -Before $regBefore -SuccessMessage "SSL 2.0 / 3.0 registry settings applied."
 
-    foreach ($f in 'SMB1Protocol', 'SMB1Protocol-Client', 'SMB1Protocol-Server', 'TelnetClient', 'TFTP', 'MicrosoftWindowsPowerShellV2Root', 'MicrosoftWindowsPowerShellV2') {
-        try {
-            $feat = Get-WindowsOptionalFeature -Online -FeatureName $f -ErrorAction Stop
-            if ($feat.State -eq 'Enabled') {
-                Disable-WindowsOptionalFeature -Online -FeatureName $f -NoRestart -ErrorAction Stop | Out-Null
-                Write-Ok "Disabled feature: $f"
-            }
-        }
-        catch {}
-    }
+    Disable-ToolkitLegacyFeatures
 
     Write-Host "`nNon-default network shares:" -ForegroundColor Cyan
     $shares = Get-SmbShare -Special $false -ErrorAction SilentlyContinue
     if ($shares) {
         $shares | Format-Table Name, Path, Description -AutoSize
         foreach ($s in $shares) {
+            if($s.Name -in 'SYSVOL','NETLOGON'){Write-Host "Preserving required domain share $($s.Name).";continue}
             if (Confirm-Action "Remove share '$($s.Name)' ($($s.Path))?" $false) { Remove-SmbShare -Name $s.Name -Force -ErrorAction SilentlyContinue; Write-Ok "Removed $($s.Name)" }
         }
     }
@@ -1188,6 +1211,7 @@ function Set-NetworkHardening {
 # 21  User rights assignment   (CIS 2.2)
 # =====================================================================
 function Set-UserRights {
+    if(Test-ToolkitServer){Remove-ServerDomainUsersBackupRight;return}
     Write-Section "21) User rights assignment (CIS 2.2)"
     Write-Warn "This can break services that run as non-default accounts (IIS, SQL Server, backup agents...)."
     if (-not (Confirm-Action "Apply CIS user rights assignments?" $false)) { return }
@@ -1376,6 +1400,7 @@ function Read-AuthorizedLists {
 }
 
 function Invoke-ReadmeAudit {
+    if(Test-ToolkitDomainController){Import-ServerImageRules;if($script:ServerImageRules){Invoke-ServerAdAccountAudit};return}
     Write-Section "23) README audit - authorized users and administrators"
     $file = $null
     $cands = @(Find-ReadmeFile)
@@ -1490,6 +1515,7 @@ function Invoke-ReadmeAudit {
 # 88  Run everything
 # =====================================================================
 function Invoke-Everything {
+    if(Test-ToolkitServer){Invoke-ServerBaseline;return}
     Write-Section "RUN EVERYTHING"
     if (-not (Confirm-Action "Have you read the README and noted required users, services and software?" $false)) { return }
     if (-not (Confirm-Action "Apply ALL hardening steps now?" $false)) { return }
@@ -1536,13 +1562,13 @@ function Show-Menu {
     Write-Host "   #####   ##   ##  #######  ##   ####     ##   " -ForegroundColor Cyan
     Write-Host $line -ForegroundColor Cyan
     Write-Host "                         ~Written by: JASIAH.O~" -ForegroundColor Cyan
-    Write-Host "   $(Get-OSLabel)   |   CIS Level 1 aligned" -ForegroundColor DarkCyan
+    Write-Host "   $(Get-OSLabel)   |   Windows 11 / Server 2022 role-aware toolkit" -ForegroundColor DarkCyan
     Write-Host $line -ForegroundColor Cyan
     $rows = @(
         @('1) Set user properties', '2) Change all passwords'),
         @('3) Disable guest/admin', '4) Set password policy'),
         @('5) Set lockout policy', '6) Enable Firewall (CIS 9)'),
-        @('7) Search for media files', '8) Disable services'),
+        @('7) Search for media files', '8) Services enable/disable'),
         @('9) Turn on UAC', '10) Remote Desktop config'),
         @('11) Configure auto update', '12) Security options (CIS 2.3)'),
         @('13) Audit the machine', '14) Users & groups manager'),
@@ -1552,12 +1578,20 @@ function Show-Menu {
         @('21) User rights (CIS 2.2)', '22) Recon / forensics helpers'),
         @('88) RUN EVERYTHING', '70) Reboot'),
         @('23) README user/admin audit', '24) Windows Warrior walkthrough'),
-        @('25) Global object auditing (opt-in)', '69) Exit')
+        @('25) Global object auditing (opt-in)', '26) Server roles / Active Directory'),
+        @('70) Reboot', '69) Exit')
     )
     foreach ($r in $rows) { Write-Host ("{0,-38}{1}" -f $r[0], $r[1]) }
     Write-Host $line -ForegroundColor Cyan
 }
 
+# Detect OS and roles before offering account/service changes.
+$serverSupport=Join-Path $PSScriptRoot 'Windows-Server.ps1'
+if(-not (Test-Path -LiteralPath $serverSupport -PathType Leaf)){Write-Error 'Windows-Server.ps1 is missing. Extract the complete updated repository ZIP.';exit 1}
+. $serverSupport
+$script:ToolkitPlatform=Get-ToolkitPlatform
+if($script:ToolkitPlatform.IsServer -and -not $script:ToolkitPlatform.IsServer2022){Write-Warn 'This server build is outside the Server 2022 profile. Review compatibility before applying changes.'}
+Write-Host "Detected: $($script:ToolkitPlatform.Caption); domain controller: $($script:ToolkitPlatform.IsDomainController)"
 # Built-in policy helpers and guided companion ship in the repository ZIP.
 $policySupport=Join-Path $PSScriptRoot 'Windows-Policy.ps1'
 if(Test-Path -LiteralPath $policySupport -PathType Leaf){. $policySupport}
@@ -1593,7 +1627,7 @@ do {
             '5'  { Set-LockoutPolicy }
             '6'  { Enable-WindowsFirewall }
             '7'  { Search-MediaFiles }
-            '8'  { Disable-UnnecessaryServices }
+            '8'  { Invoke-ServiceManager }
             '9'  { Enable-UAC }
             '10' { Set-RemoteDesktop }
             '11' { Enable-AutoUpdate }
@@ -1611,6 +1645,7 @@ do {
             '23' { Invoke-ReadmeAudit }
             '24' { Invoke-WindowsWarrior }
             '25' { Set-GlobalObjectAuditing }
+            '26' { Invoke-ServerRoleManager }
             '88' { Invoke-Everything }
             '69' { try { Stop-Transcript | Out-Null } catch {}; exit }
             '70' { try { Stop-Transcript | Out-Null } catch {}; Restart-Computer -Force }

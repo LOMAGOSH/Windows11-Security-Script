@@ -1,7 +1,10 @@
 #Requires -Version 5.1
 $ErrorActionPreference='Stop'
-$root=Split-Path -Parent $PSScriptRoot
-. (Join-Path $root 'Windows-Policy.ps1')
+$root=Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$tokens=$null;$errors=$null
+$tree=[System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'LOMAGOSH-Windows11.ps1'),[ref]$tokens,[ref]$errors)
+if($errors.Count){throw ($errors | Out-String)}
+foreach($node in $tree.EndBlock.Statements){if($node -is [System.Management.Automation.Language.FunctionDefinitionAst]){. ([scriptblock]::Create($node.Extent.Text))}}
 $script:passed=0
 function Assert-True($Value,$Message){if(-not $Value){throw "FAILED: $Message"}}
 function Test-Case($Name,[scriptblock]$Action){& $Action;$script:passed++;Write-Host "PASS: $Name"}
