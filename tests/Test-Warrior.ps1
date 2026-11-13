@@ -18,6 +18,7 @@ $script:confirm = $true
 $script:actions = New-Object 'System.Collections.Generic.List[object]'
 $script:good = @(); $script:bad = @()
 $script:RegFail = 0; $script:FailureCount = 0; $script:CurrentUserName = 'student'
+$script:PreHardeningNetworkSnapshot=$null
 function Read-Host {
     param($Prompt, [switch]$AsSecureString)
     if (-not $script:inputQueue.Count) { throw "Unexpected prompt: $Prompt" }
@@ -199,7 +200,7 @@ try {
         function Get-NetTCPConnection { param($State,$ErrorAction) @([pscustomobject]@{LocalAddress='127.0.0.1';LocalPort=53123;OwningProcess=1234},[pscustomobject]@{LocalAddress='0.0.0.0';LocalPort=62000;OwningProcess=1235}) }
         function Get-Process { param($Id,$ErrorAction) [pscustomobject]@{ProcessName='test';Path='C:\Tools\test.exe'} }
         $findings=@(Get-WarriorForensicFindings -ScheduledTaskName DifferentImageTask -StartupValueName DifferentStartup)
-        Assert-True ($findings.Count -eq 4 -and $findings[0].SuggestedAnswer -eq '22631') 'Observed build reported'
+        Assert-True ($findings.Count -eq 6 -and $findings[0].SuggestedAnswer -eq '22631') 'Observed build and additional network/share topics reported'
         Assert-True ($findings[1].SuggestedAnswer -eq 'C:\Tools\evidence.exe') 'Selected task evidence reported'
         Assert-True ($findings[3].Status -eq 'Review required' -and $findings[3].SuggestedAnswer -notmatch '^\d+$') 'No unsupported port answer'
         $inventory=@(Get-WarriorForensicFindings)
@@ -210,6 +211,28 @@ try {
         $key=@(Get-GlobalAuditArguments Key 'S-1-5-21-111-222-333-1001' Read)
         Assert-True ($file -contains '/access:FRFW' -and $file -contains '/user:{S-1-5-21-111-222-333-1001}') 'File rights and SID preserved'
         Assert-True ($key -contains '/access:KR' -and $key -contains '/type:Key') 'Registry read-only selection preserved'
+    }
+    Test-Case 'Mirror plus ROT13 transforms the supplied cipher deterministically' {
+        Assert-True ((Convert-ForensicCipher 'lnj ehbl ab ren hbL') -ceq 'You are on your way') 'Supplied cipher decoded'
+        Assert-True ((Convert-ForensicCipher 'ZAbz!' Rot13) -ceq 'MNom!') 'ROT13 wraps alphabet and preserves punctuation'
+        Assert-True ((Convert-ForensicCipher 'Abc' Atbash) -ceq 'Zyx') 'Atbash remains a distinct selected method'
+    }
+    Test-Case 'Pasted netstat evidence does not invent System port 139' {
+        $netstat="  TCP    0.0.0.0:135    0.0.0.0:0    LISTENING    460`n  TCP    0.0.0.0:445    0.0.0.0:0    LISTENING    4`n  TCP    [::]:445    [::]:0    LISTENING    4`n  TCP    0.0.0.0:43201    0.0.0.0:0    LISTENING    5440"
+        $rows=@(Read-NetstatListeners -Text $netstat)
+        $finding=Get-SystemListenerFinding -Connections $rows -Source 'pasted netstat'
+        Assert-True ($rows.Count -eq 4 -and $finding.Status -eq 'Review required' -and $finding.SuggestedAnswer -eq '') 'No unsupported port answer'
+        $actual=Get-SystemListenerFinding -Connections @([pscustomobject]@{LocalPort=445;OwningProcess=4},[pscustomobject]@{LocalPort=139;OwningProcess=4})
+        Assert-True ($actual.Status -eq 'Observed' -and $actual.SuggestedAnswer -eq '139') '139 suggested only when observed'
+    }
+    Test-Case 'Pre-hardening network capture preserves timestamped evidence without changing the system' {
+        Reset-Records
+        function Get-NetTCPConnection {param($State,$ErrorAction) [pscustomobject]@{LocalAddress='0.0.0.0';LocalPort=139;OwningProcess=4}}
+        Save-PreHardeningNetworkSnapshot
+        $files=@(Get-ChildItem -LiteralPath $temporary -Filter 'Network-before-this-run-*.json')
+        $saved=Get-Content -LiteralPath $files[0].FullName -Raw | ConvertFrom-Json
+        Assert-True ($files.Count -eq 1 -and $saved.CapturedAtUtc -and $saved.Connections[0].LocalPort -eq 139 -and $script:actions.Count -eq 0) 'Read-only snapshot persisted'
+        $script:PreHardeningNetworkSnapshot=$null
     }
     Test-Case 'Cleanup removes only a selected service from another image' {
         Reset-Records; $script:inputQueue.Enqueue('AnotherBadService')

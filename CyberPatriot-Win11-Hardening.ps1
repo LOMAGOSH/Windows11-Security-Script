@@ -179,53 +179,6 @@ function Invoke-NativeCommand {
     $output
 }
 
-function Assert-MicrosoftLgpoSignature {
-    param([string]$Path)
-    $signature = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
-    if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
-        $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
-        throw "LGPO.exe must have a valid Microsoft Corporation signature: $Path"
-    }
-}
-
-function Get-LgpoExecutable {
-    $cache = Join-Path $env:ProgramData 'CyberPatriot-Hardening\Tools'
-    $cachedExe = Join-Path $cache 'LGPO.exe'
-    foreach ($candidate in @((Join-Path $PSScriptRoot 'tools\LGPO.exe'), $cachedExe)) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            Assert-MicrosoftLgpoSignature -Path $candidate
-            return $candidate
-        }
-    }
-    # Official Microsoft Security Compliance Toolkit distribution. Never use an
-    # unsigned mirror or bypass TLS/signature validation if this download fails.
-    $url = 'https://download.microsoft.com/download/8/5/C/85C25433-A1B0-4FFA-9429-7E023E7F3F39/LGPO.zip'
-    $scratch = Join-Path $env:TEMP ('cp-lgpo-' + [guid]::NewGuid())
-    $previousTls = [Net.ServicePointManager]::SecurityProtocol
-    try {
-        $null = [IO.Directory]::CreateDirectory($scratch)
-        $zip = Join-Path $scratch 'LGPO.zip'
-        [Net.ServicePointManager]::SecurityProtocol = $previousTls -bor [Net.SecurityProtocolType]::Tls12
-        Write-Host 'Downloading Microsoft LGPO to persist advanced audit settings in Local Group Policy...'
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
-        Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $scratch 'expanded') -ErrorAction Stop
-        $executables = @(Get-ChildItem -LiteralPath (Join-Path $scratch 'expanded') -Recurse -File -Filter LGPO.exe -ErrorAction Stop)
-        if ($executables.Count -ne 1) { throw 'The Microsoft archive did not contain exactly one LGPO.exe.' }
-        Assert-MicrosoftLgpoSignature -Path $executables[0].FullName
-        $null = [IO.Directory]::CreateDirectory($cache)
-        Copy-Item -LiteralPath $executables[0].FullName -Destination $cachedExe -ErrorAction Stop
-        Assert-MicrosoftLgpoSignature -Path $cachedExe
-        return $cachedExe
-    }
-    catch {
-        throw "Cannot prepare Microsoft LGPO: $($_.Exception.Message). Alternatively, download LGPO from Microsoft's Security Compliance Toolkit (https://www.microsoft.com/download/details.aspx?id=55319) and place its signed LGPO.exe in the tools folder beside this script."
-    }
-    finally {
-        [Net.ServicePointManager]::SecurityProtocol = $previousTls
-        if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-}
-
 function Read-SystemAuditPolicy {
     param([string]$Path)
     # auditpol localizes CSV headers; the seven-column schema is fixed.
@@ -345,38 +298,25 @@ function Disable-GuestAdmin {
 # 4  Password policy   (CIS 1.1)
 # =====================================================================
 function Set-PasswordPolicy {
-    $regBefore = $script:RegFail
-    Write-Section "4) Password policy (CIS 1.1)"
-    $cfg = $null
+    Write-Section "4) Apply and verify password policy"
+    $regBefore=$script:RegFail
     try {
-        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/uniquepw:$PwHistory") | Out-Null
-        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/maxpwage:$PwMaxAge") | Out-Null
-        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/minpwage:$PwMinAge") | Out-Null
-        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/minpwlen:$PwMinLen") | Out-Null
-
-        $cfg = Join-Path $env:TEMP 'cp-pwpol.inf'
-        $inf = @"
-[Unicode]
-Unicode=yes
-[System Access]
-PasswordComplexity = 1
-ClearTextPassword = 0
-LSAAnonymousNameLookup = 0
-MinimumPasswordAge = $PwMinAge
-MaximumPasswordAge = $PwMaxAge
-MinimumPasswordLength = $PwMinLen
-PasswordHistorySize = $PwHistory
-[Version]
-signature="`$CHICAGO`$"
-Revision=1
-"@
-        Set-Content -Path $cfg -Value $inf -Encoding Unicode -ErrorAction Stop
-        Invoke-NativeCommand -FilePath secedit.exe -ArgumentList @('/configure', '/db', (Join-Path $env:TEMP 'cp-pwpol.sdb'), '/cfg', $cfg, '/areas', 'SECURITYPOLICY', '/quiet') | Out-Null
-        Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'NoLMHash' 1
-        Write-RegistryResult -Before $regBefore -SuccessMessage "Password policy configured: history $PwHistory, max $PwMaxAge d, min $PwMinAge d, length $PwMinLen, complexity on, no reversible encryption."
+        if($PwMinLen -lt 1 -or $PwMinLen -gt 128 -or $PwMinAge -lt 0 -or $PwMaxAge -le $PwMinAge -or $PwHistory -lt 0 -or $PwHistory -gt 24) {
+            throw 'Invalid password settings: use length 1-128, maximum age greater than minimum age, and history 0-24.'
+        }
+        $work=Join-Path $script:LogDir ('PasswordPolicy-'+[guid]::NewGuid())
+        $null=[IO.Directory]::CreateDirectory($work)
+        Write-Host "Password policy work/backup folder: $work"
+        Invoke-NativeCommand secedit.exe @('/export','/mergedpolicy','/cfg',(Join-Path $work 'before.inf'),'/areas','SECURITYPOLICY','/quiet') | Out-Null
+        $desired=[ordered]@{MinimumPasswordAge=$PwMinAge;MaximumPasswordAge=$PwMaxAge;MinimumPasswordLength=$PwMinLen;PasswordHistorySize=$PwHistory;PasswordComplexity=1;ClearTextPassword=0}
+        Set-AccountPolicyValues -Values $desired -Work $work
+        Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' NoLMHash 1
+        Confirm-AccountPolicy -Desired $desired -Work $work
+        Confirm-EnabledAccountPasswordFlags
+        Write-RegistryResult -Before $regBefore -SuccessMessage "Verified password policy: history $PwHistory, max $PwMaxAge d, min $PwMinAge d, length $PwMinLen, complexity on, reversible encryption off; enabled-account password flags verified."
+        Write-Host "Policy backup and read-back files: $work"
     }
-    catch { Write-Bad "Error configuring password policy: $_" }
-    finally { if ($cfg) { Remove-Item -LiteralPath $cfg -ErrorAction SilentlyContinue } }
+    catch { Write-Bad "Password policy was not fully verified: $($_.Exception.Message)" }
     Wait-Key
 }
 
@@ -384,14 +324,22 @@ Revision=1
 # 5  Lockout policy   (CIS 1.2)
 # =====================================================================
 function Set-LockoutPolicy {
-    Write-Section "5) Account lockout policy (CIS 1.2)"
+    Write-Section "5) Apply and verify account lockout policy"
     try {
-        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/lockoutthreshold:$LockThreshold") | Out-Null
-        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/lockoutduration:$LockDuration") | Out-Null
-        Invoke-NativeCommand -FilePath net.exe -ArgumentList @('accounts', "/lockoutwindow:$LockWindow") | Out-Null
-        Write-Ok "Lockout: $LockThreshold attempts, $LockDuration min duration, $LockWindow min reset window."
+        if($LockThreshold -lt 1 -or $LockThreshold -gt 999 -or $LockWindow -lt 1 -or $LockDuration -lt $LockWindow -or $LockDuration -gt 99999) {
+            throw 'Invalid lockout settings: threshold 1-999, window at least 1 minute, duration at least the window and at most 99999 minutes.'
+        }
+        $work=Join-Path $script:LogDir ('LockoutPolicy-'+[guid]::NewGuid())
+        $null=[IO.Directory]::CreateDirectory($work)
+        Write-Host "Lockout policy work/backup folder: $work"
+        Invoke-NativeCommand secedit.exe @('/export','/mergedpolicy','/cfg',(Join-Path $work 'before.inf'),'/areas','SECURITYPOLICY','/quiet') | Out-Null
+        $desired=[ordered]@{LockoutBadCount=$LockThreshold;LockoutDuration=$LockDuration;ResetLockoutCount=$LockWindow}
+        Set-AccountPolicyValues -Values $desired -Work $work
+        Confirm-AccountPolicy -Desired $desired -Work $work
+        Write-Ok "Verified lockout: $LockThreshold attempts, $LockDuration min duration, $LockWindow min reset window."
+        Write-Host "Policy backup and read-back files: $work"
     }
-    catch { Write-Bad "Error configuring lockout policy: $_" }
+    catch { Write-Bad "Lockout policy was not fully verified: $($_.Exception.Message)" }
     Wait-Key
 }
 
@@ -692,79 +640,67 @@ function Set-SecurityOptions {
 # =====================================================================
 function Enable-Auditing {
     param([guid[]]$SubcategoryGuid = @())
-    $regBefore = $script:RegFail
-    Write-Section "13) Advanced audit policy - local Group Policy and effective settings"
+    $regBefore=$script:RegFail
+    Write-Section '13) System audit policy - built-in Windows tools'
     try {
-        $lgpo = Get-LgpoExecutable
-        $work = Join-Path $script:LogDir ('AuditPolicy-' + [guid]::NewGuid())
-        $null = [IO.Directory]::CreateDirectory($work)
-        $backup = Join-Path $work 'LocalGpoBackup'
-        $null = [IO.Directory]::CreateDirectory($backup)
-        Invoke-NativeCommand -FilePath $lgpo -ArgumentList @('/b', $backup, '/n', 'Before CyberPatriot audit configuration') | Out-Null
-        $before = Join-Path $work 'audit-before.csv'
-        Invoke-NativeCommand -FilePath auditpol.exe -ArgumentList @('/backup', "/file:$before") | Out-Null
-        $current = @(Read-SystemAuditPolicy -Path $before)
-        foreach ($guid in $SubcategoryGuid) {
-            if (@($current | Where-Object { [guid]$_.'Subcategory GUID' -eq $guid }).Count -ne 1) {
-                throw "Windows did not report audit subcategory $guid. No audit settings were changed."
-            }
+        $work=Join-Path $script:LogDir ('AuditPolicy-'+[guid]::NewGuid())
+        $null=[IO.Directory]::CreateDirectory($work)
+        Write-Host "Audit policy work/backup folder: $work"
+        $before=Join-Path $work 'audit-before.csv'
+        Invoke-NativeCommand auditpol.exe @('/backup',"/file:$before") | Out-Null
+        $current=@(Read-SystemAuditPolicy -Path $before)
+        foreach($guid in $SubcategoryGuid) {
+            if(@($current | Where-Object {[guid]$_.'Subcategory GUID' -eq $guid}).Count -ne 1){throw "Windows did not report subcategory $guid; no audit policy was changed."}
         }
-        # Use Windows' own subcategory GUIDs, not localized display names. This
-        # preserves the existing all-subcategories Success+Failure behavior.
-        $desired = @($current | ForEach-Object {
-            $selected = $SubcategoryGuid.Count -eq 0 -or $SubcategoryGuid -contains [guid]$_.'Subcategory GUID'
+        $desired=@($current | ForEach-Object {
+            $selected=$SubcategoryGuid.Count -eq 0 -or $SubcategoryGuid -contains [guid]$_.'Subcategory GUID'
             [pscustomobject][ordered]@{
-                'Machine Name' = ''
-                'Policy Target' = 'System'
-                'Subcategory' = $_.Subcategory
-                'Subcategory GUID' = $_.'Subcategory GUID'
-                'Inclusion Setting' = if ($selected) { 'Success and Failure' } else { $_.'Inclusion Setting' }
-                'Exclusion Setting' = ''
-                'Setting Value' = if ($selected) { '3' } else { $_.'Setting Value' }
+                'Machine Name'='';'Policy Target'='System';'Subcategory'=$_.Subcategory;'Subcategory GUID'=$_.'Subcategory GUID'
+                'Inclusion Setting'=if($selected){'Success and Failure'}else{$_.'Inclusion Setting'}
+                'Exclusion Setting'=$_.'Exclusion Setting';'Setting Value'=if($selected){'3'}else{$_.'Setting Value'}
             }
         })
-        $csv = Join-Path $work 'audit-desired.csv'
-        $desired | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
-        $registryPolicy = Join-Path $work 'audit-registry.txt'
-        @'
-Computer
-SYSTEM\CurrentControlSet\Control\Lsa
-SCENoApplyLegacyAuditPolicy
-DWORD:1
-
-Computer
-SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit
-ProcessCreationIncludeCmdLine_Enabled
-DWORD:1
-
-'@ | Set-Content -LiteralPath $registryPolicy -Encoding Unicode -ErrorAction Stop
-        Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1
-        Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' 'ProcessCreationIncludeCmdLine_Enabled' 1
-        if ($script:RegFail -gt $regBefore) { throw 'Required audit registry settings could not be written.' }
-        # LGPO merges these entries into Registry.pol and registers the audit
-        # client-side extension; auditpol alone does not configure the GPO UI.
-        Invoke-NativeCommand -FilePath $lgpo -ArgumentList @('/t', $registryPolicy, '/a', $csv) | Out-Null
-        Invoke-NativeCommand -FilePath gpupdate.exe -ArgumentList @('/target:computer', '/force', '/wait:60') | Out-Null
-        $persisted = Join-Path $env:SystemRoot 'System32\GroupPolicy\Machine\Microsoft\Windows NT\Audit\audit.csv'
-        Assert-AuditPolicy -Expected $desired -Actual @(Read-SystemAuditPolicy -Path $persisted) -Store 'Local Group Policy'
-        $effective = Join-Path $work 'audit-effective.csv'
-        Invoke-NativeCommand -FilePath auditpol.exe -ArgumentList @('/backup', "/file:$effective") | Out-Null
-        Assert-AuditPolicy -Expected $desired -Actual @(Read-SystemAuditPolicy -Path $effective) -Store 'effective audit policy'
-        foreach ($setting in @(
-            @('HKLM:\SYSTEM\CurrentControlSet\Control\Lsa', 'SCENoApplyLegacyAuditPolicy'),
-            @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit', 'ProcessCreationIncludeCmdLine_Enabled')
-        )) {
-            if ((Get-ItemProperty -LiteralPath $setting[0] -Name $setting[1] -ErrorAction Stop).($setting[1]) -ne 1) {
-                throw "Required audit setting was overridden: $($setting[1])"
-            }
+        $csv=Join-Path $work 'audit-desired.csv'
+        $desired | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding Unicode -ErrorAction Stop
+        # The Windows API saves Registry.pol and registers the installed audit CSE.
+        # It updates Group Policy revisions itself; no download or hand-edited GPT.ini.
+        $persisted=Save-LocalAuditPolicy -Csv $csv -Work $work -Legacy:($SubcategoryGuid.Count -eq 0)
+        if($SubcategoryGuid.Count -eq 0) {
+            $legacy=Join-Path $work 'legacy-effective.inf'
+            New-SecurityPolicyInf -Section 'Event Audit' -Values (Get-LegacyAuditValues) | Set-Content -LiteralPath $legacy -Encoding Unicode -ErrorAction Stop
+            Invoke-NativeCommand secedit.exe @('/configure','/db',(Join-Path $work 'audit.sdb'),'/cfg',$legacy,'/areas','SECURITYPOLICY','/quiet') | Out-Null
         }
-        $selectedCount = if ($SubcategoryGuid.Count) { $SubcategoryGuid.Count } else { $desired.Count }
-        Write-Ok "Verified $selectedCount requested advanced audit subcategories in local GPO and effective policy: Success and Failure."
-        Write-Host "Policy backups and verification CSVs: $work"
-        Write-Host 'Close and reopen secpol.msc/gpedit.msc to refresh the displayed configuration.'
-        Write-Host 'Global Object Access Auditing SACLs are separate and were left unchanged.'
+        Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' SCENoApplyLegacyAuditPolicy 1
+        Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' ProcessCreationIncludeCmdLine_Enabled 1
+        if($script:RegFail -gt $regBefore){throw 'Required audit registry values were refused.'}
+        $targets=if($SubcategoryGuid.Count){$SubcategoryGuid}else{@('*')}
+        foreach($target in $targets) {
+            Invoke-NativeCommand auditpol.exe @('/set',"/subcategory:$target",'/success:enable','/failure:enable') | Out-Null
+        }
+        Invoke-NativeCommand gpupdate.exe @('/target:computer','/force','/wait:60') | Out-Null
+        Assert-AuditPolicy -Expected $desired -Actual @(Read-SystemAuditPolicy -Path $persisted) -Store 'Local Group Policy'
+        $effective=Join-Path $work 'audit-effective.csv'
+        Invoke-NativeCommand auditpol.exe @('/backup',"/file:$effective") | Out-Null
+        Assert-AuditPolicy -Expected $desired -Actual @(Read-SystemAuditPolicy -Path $effective) -Store 'effective audit policy'
+        foreach($setting in @(
+            @('HKLM:\SYSTEM\CurrentControlSet\Control\Lsa','SCENoApplyLegacyAuditPolicy'),
+            @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit','ProcessCreationIncludeCmdLine_Enabled')
+        )) {
+            if((Get-ItemProperty -LiteralPath $setting[0] -Name $setting[1] -ErrorAction Stop).($setting[1]) -ne 1){throw "Audit registry setting overridden: $($setting[1])"}
+        }
+        if(-not $SubcategoryGuid.Count) {
+            $legacyState=Join-Path $work 'legacy-verified.inf'
+            Invoke-NativeCommand secedit.exe @('/export','/cfg',$legacyState,'/areas','SECURITYPOLICY','/quiet') | Out-Null
+            $actual=Read-PolicyInfSection -Text (Get-Content -LiteralPath $legacyState -Raw -ErrorAction Stop) -Section 'Event Audit'
+            $legacyValues=Get-LegacyAuditValues
+            foreach($key in $legacyValues.Keys){if(-not $actual.ContainsKey($key) -or $actual[$key] -ne '3'){throw "Legacy audit category not verified: $key"}}
+        }
+        $count=if($SubcategoryGuid.Count){$SubcategoryGuid.Count}else{$desired.Count}
+        Write-Ok "Verified $count advanced audit subcategories in local GPO and effective policy: Success and Failure."
+        Write-Host "Backups and verification files: $work"
+        Write-Host 'Reopen secpol.msc/gpedit.msc to refresh the display. Global object SACLs remain a separate opt-in setup.'
     }
-    catch { Write-Bad "Advanced audit configuration or verification failed: $_" }
+    catch { Write-Bad "System audit policy was not fully verified: $($_.Exception.Message)" }
     Wait-Key
 }
 
@@ -1622,10 +1558,14 @@ function Show-Menu {
     Write-Host $line -ForegroundColor Cyan
 }
 
-# Optional guided tutorial companion: download/extract the complete repository.
+# Built-in policy helpers and guided companion ship in the repository ZIP.
+$policySupport=Join-Path $PSScriptRoot 'Windows-Policy.ps1'
+if(Test-Path -LiteralPath $policySupport -PathType Leaf){. $policySupport}
+else{Write-Warn 'Options 4/5/13 require Windows-Policy.ps1 beside the main script. Download the complete repository ZIP.'}
 $walkthrough = Join-Path $PSScriptRoot 'Windows-Warrior.ps1'
 if (Test-Path -LiteralPath $walkthrough -PathType Leaf) { . $walkthrough }
 else { Write-Warn 'For options 24/25, download the complete repository including Windows-Warrior.ps1.' }
+if(Get-Command Save-PreHardeningNetworkSnapshot -ErrorAction SilentlyContinue){Save-PreHardeningNetworkSnapshot}
 
 # Initial prompt
 Clear-Host

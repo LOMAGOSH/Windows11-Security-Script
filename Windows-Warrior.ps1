@@ -333,6 +333,54 @@ function Invoke-WarriorTask {
     catch { Write-Bad "Task $Id failed: $($_.Exception.Message)" }
 }
 
+function Convert-ForensicCipher {
+    param([string]$Text,[ValidateSet('ReverseRot13','Reverse','Rot13','Atbash')][string]$Method='ReverseRot13')
+    $characters=$Text.ToCharArray()
+    if($Method -in 'ReverseRot13','Reverse'){[Array]::Reverse($characters)}
+    $output=New-Object Text.StringBuilder
+    foreach($character in $characters) {
+        $code=[int]$character
+        $start=if($code -ge 65 -and $code -le 90){65}elseif($code -ge 97 -and $code -le 122){97}else{-1}
+        if($start -ge 0 -and $Method -in 'ReverseRot13','Rot13'){$code=$start+(($code-$start+13)%26)}
+        elseif($start -ge 0 -and $Method -eq 'Atbash'){$code=$start+25-($code-$start)}
+        $null=$output.Append([char]$code)
+    }
+    $output.ToString()
+}
+
+function Read-NetstatListeners {
+    param([string]$Text)
+    foreach($line in ($Text -split '\r?\n')) {
+        if($line -match '^\s*TCP\s+(\S+):(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$') {
+            [pscustomobject]@{LocalAddress=$Matches[1];LocalPort=[int]$Matches[2];OwningProcess=[uint32]$Matches[3]}
+        }
+    }
+}
+
+function Get-SystemListenerFinding {
+    param([object[]]$Connections,[string]$Source='current live TCP listeners')
+    $system=@($Connections | Where-Object {[uint32]$_.OwningProcess -eq 4})
+    $all=@($system.LocalPort | Sort-Object -Unique)
+    $other=@($all | Where-Object {$_ -ne 445})
+    $answer='';$status='Review required'
+    if($other.Count -eq 1){$answer=[string]$other[0];$status='Observed'}
+    $detail="Source: $Source. Observed PID 4 TCP listener ports: $($all -join ', ')."
+    if(-not $other.Count){$detail+=' No other port besides 445 was observed. Do not infer 139 or reconstruct the original image state from this output.'}
+    elseif($other.Count -gt 1){$detail+=' Multiple other ports are present; match the evidence to the actual question.'}
+    [pscustomobject]@{Topic='System TCP port besides 445';Status=$status;SuggestedAnswer=$answer;Evidence=$detail}
+}
+
+function Save-PreHardeningNetworkSnapshot {
+    try {
+        $connections=@(Get-NetTCPConnection -State Listen -ErrorAction Stop | Select-Object LocalAddress,LocalPort,OwningProcess)
+        $script:PreHardeningNetworkSnapshot=[pscustomobject]@{CapturedAtUtc=[datetime]::UtcNow.ToString('o');Connections=$connections}
+        $file=Join-Path $script:LogDir ('Network-before-this-run-'+[guid]::NewGuid()+'.json')
+        $script:PreHardeningNetworkSnapshot | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $file -Encoding UTF8 -ErrorAction Stop
+        Write-Host "Read-only network snapshot saved before this run's hardening: $file"
+    }
+    catch {Write-Warn "Could not capture pre-hardening TCP evidence: $($_.Exception.Message)"}
+}
+
 function Get-WarriorForensicFindings {
     param([string]$ScheduledTaskName = '', [string]$StartupValueName = '')
     $results = New-Object 'System.Collections.Generic.List[object]'
@@ -372,12 +420,26 @@ function Get-WarriorForensicFindings {
         })
         $results.Add([pscustomobject]@{Topic='Listening ports'; Status='Review required'; SuggestedAnswer='Identify the unexpected listener from its process and path; high ports alone are not proof.'; Evidence=($ports | Format-Table -AutoSize | Out-String -Width 240)})
     } catch { $results.Add([pscustomobject]@{Topic='Listening ports'; Status='Unavailable'; SuggestedAnswer=''; Evidence=$_.Exception.Message}) }
+    try {
+        $connections=@(Get-NetTCPConnection -State Listen -ErrorAction Stop)
+        $results.Add((Get-SystemListenerFinding -Connections $connections))
+        if($script:PreHardeningNetworkSnapshot) {
+            $prior=Get-SystemListenerFinding -Connections $script:PreHardeningNetworkSnapshot.Connections -Source ("snapshot before this run at "+$script:PreHardeningNetworkSnapshot.CapturedAtUtc+'; not proof of an untouched original image')
+            $prior.Topic='System TCP listeners before this run'
+            $results.Add($prior)
+        }
+    } catch { $results.Add([pscustomobject]@{Topic='System TCP port besides 445';Status='Unavailable';SuggestedAnswer='';Evidence=$_.Exception.Message}) }
+    try {
+        $shares=@(Get-SmbShare -ErrorAction Stop)
+        $observed=@($shares | Where-Object Name -eq 'IPC$').Count -eq 1
+        $results.Add([pscustomobject]@{Topic='Default IPC administrative share';Status=if($observed){'Observed'}else{'Reference; not observed'};SuggestedAnswer='IPC$';Evidence=('IPC$ is the standard IPC share used alongside C$ and ADMIN$. Shares on this host: '+($shares.Name -join ', '))})
+    } catch { $results.Add([pscustomobject]@{Topic='Default IPC administrative share';Status='Reference; host inventory unavailable';SuggestedAnswer='IPC$';Evidence='IPC$ is the standard IPC share. '+$_.Exception.Message}) }
     $results
 }
 
 function Invoke-WarriorForensics {
     Write-Section 'Read-only forensics helpers for the current image'
-    Write-Host 'These are four investigation topics, not assumptions about question numbering or answers. Match the evidence to your actual question files.'
+    Write-Host 'These investigation topics do not assume question numbering. Match observed evidence and reference facts to your actual question files.'
     $question = Read-Host 'Path to an actual forensics question file to read (Enter skips)'
     if (-not [string]::IsNullOrWhiteSpace($question)) {
         Write-Host (Get-ReadmeText -Path $question)
@@ -385,6 +447,14 @@ function Invoke-WarriorForensics {
     $task = Read-Host 'Exact scheduled task name requested by your question (Enter inventories tasks)'
     $startup = Read-Host 'Exact HKLM Run value requested by your question (Enter inventories startup values)'
     $results = @(Get-WarriorForensicFindings -ScheduledTaskName $task -StartupValueName $startup)
+    $cipher=Read-Host 'Cipher text to transform (Enter skips)'
+    if(-not [string]::IsNullOrWhiteSpace($cipher)) {
+        $method=Read-Host '1 reverse+ROT13, 2 reverse only, 3 ROT13 only, 4 Atbash; Enter skips'
+        $methods=@{'1'='ReverseRot13';'2'='Reverse';'3'='Rot13';'4'='Atbash'}
+        if($methods.ContainsKey($method)) {
+            $results += [pscustomobject]@{Topic='Cipher transformation';Status='Computed; review selected method';SuggestedAnswer=(Convert-ForensicCipher -Text $cipher -Method $methods[$method]);Evidence=("Selected method: "+$methods[$method]+"; input: "+$cipher)}
+        }
+    }
     $report = Join-Path $script:LogDir ('Windows-Warrior-Forensics-' + [guid]::NewGuid() + '.txt')
     $text = $results | Format-List Topic, Status, SuggestedAnswer, Evidence | Out-String -Width 240
     Write-Host $text
@@ -480,7 +550,7 @@ function Set-GlobalObjectAuditing {
 
 function Invoke-WindowsWarrior {
     do {
-        Write-Section 'Guided hardening - 50 example tasks and 4 forensics helpers'
+        Write-Section 'Guided hardening - 50 example tasks and forensics helpers'
         if ($script:WarriorReadmePlan) { Write-Host "Current image README: $($script:WarriorReadmePlan.Source)" }
         else { Write-Host 'No image README loaded. Choose R to load approved user/admin lists before account changes.' }
         Get-WarriorTasks | Format-Table Id, Title -AutoSize | Out-Host

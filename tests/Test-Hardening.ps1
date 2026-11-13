@@ -15,6 +15,10 @@ foreach ($node in $ast.EndBlock.Statements) {
         . ([scriptblock]::Create($node.Extent.Text))
     }
 }
+$policyTokens=$null;$policyErrors=$null
+$policyAst=[System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'Windows-Policy.ps1'),[ref]$policyTokens,[ref]$policyErrors)
+if($policyErrors.Count){throw ($policyErrors | Out-String)}
+foreach($node in $policyAst.EndBlock.Statements){if($node -is [System.Management.Automation.Language.FunctionDefinitionAst]){. ([scriptblock]::Create($node.Extent.Text))}}
 $realRegistryWriter = ${function:Set-RegistryValue}
 $realNativeRunner = ${function:Invoke-NativeCommand}
 $script:auditFixture = @('0cce923f', '0cce9240', '0cce9241', '0cce9242') | ForEach-Object {
@@ -126,7 +130,23 @@ function Set-RegistryValue {
     if ($Name -eq $script:failRegistryName) { $script:RegFail++; Write-Bad "Simulated failure: $Name"; return }
     $script:writes.Add([pscustomobject]@{Path = $Path; Name = $Name; Value = $Value; Type = $Type})
 }
-function Get-LgpoExecutable { return 'LGPO.exe' }
+$script:gpoSaves=New-Object 'System.Collections.Generic.List[object]'
+function Save-LocalAuditPolicy {
+    param($Csv,$Work,[switch]$Legacy)
+    if($script:failGpo){throw 'Native Group Policy save refused'}
+    $script:gpoSaves.Add([pscustomobject]@{Csv=$Csv;Work=$Work;Legacy=[bool]$Legacy})
+    $localPath=Join-Path $env:SystemRoot 'System32/GroupPolicy/Machine/Microsoft/Windows NT/Audit/audit.csv'
+    if(-not $script:missingLocalAudit){$null=[IO.Directory]::CreateDirectory((Split-Path -Parent $localPath));Copy-Item -LiteralPath $Csv -Destination $localPath}
+    $localPath
+}
+function Set-AccountPolicyValues {
+    param($Values,$Work)
+    if($script:failAccountApply){throw 'Account policy refused'}
+    foreach($key in $Values.Keys){$script:accountDesired[$key]=$Values[$key]}
+}
+function Get-EffectiveAccountPolicy { param($Work) $script:accountDesired }
+function Confirm-EnabledAccountPasswordFlags { }
+
 function Get-ItemProperty {
     [CmdletBinding()]
     param($LiteralPath, $Name)
@@ -144,14 +164,13 @@ function Invoke-NativeCommand {
         if ($script:overrideEffectiveAudit -and $csvPath -like '*audit-effective.csv') { $rows = $script:auditFixture }
         $rows | Export-Csv -LiteralPath $csvPath -Encoding UTF8 -NoTypeInformation
     }
-    if ($FilePath -eq 'LGPO.exe' -and $ArgumentList -contains '/a') {
-        $csvPath = $ArgumentList[[array]::IndexOf($ArgumentList, '/a') + 1]
-        $script:effectiveAudit = @(Import-Csv -LiteralPath $csvPath)
-        if (-not $script:missingLocalAudit) {
-            $localPath = Join-Path $env:SystemRoot 'System32/GroupPolicy/Machine/Microsoft/Windows NT/Audit/audit.csv'
-            $null = [IO.Directory]::CreateDirectory((Split-Path -Parent $localPath))
-            $script:effectiveAudit | Export-Csv -LiteralPath $localPath -Encoding UTF8 -NoTypeInformation
-        }
+    if ($FilePath -eq 'auditpol.exe' -and $ArgumentList[0] -eq '/set') {
+        $target=$ArgumentList[1].Substring(13)
+        foreach($row in $script:effectiveAudit){if($target -eq '*' -or [guid]$row.'Subcategory GUID' -eq [guid]$target){$row.'Setting Value'='3'}}
+    }
+    if($FilePath -eq 'secedit.exe' -and $ArgumentList -contains '/export') {
+        $path=$ArgumentList[[array]::IndexOf($ArgumentList,'/cfg')+1]
+        New-SecurityPolicyInf -Section 'Event Audit' -Values (Get-LegacyAuditValues) | Set-Content -LiteralPath $path -Encoding Unicode
     }
 }
 $script:firewall = @{}
@@ -184,6 +203,8 @@ function Disable-NetFirewallRule { param($DisplayGroup, $ErrorAction) }
 function Reset-Records {
     $script:writes.Clear(); $script:nativeCalls.Clear(); $script:good.Clear(); $script:bad.Clear()
     $script:failNative = ''; $script:failRegistryName = ''
+    $script:failAccountApply=$false;$script:accountDesired=@{};$script:gpoSaves.Clear();$script:failGpo=$false
+    $script:effectiveAudit=@($script:auditFixture | Select-Object *)
     $script:overrideEffectiveAudit = $false; $script:overrideAuditRegistry = $false; $script:missingLocalAudit = $false
     $script:overrideEffectiveFirewall = $false; $script:failFirewallWrite = $false; $script:firewall = @{}
     $localPath = Join-Path $env:SystemRoot 'System32/GroupPolicy/Machine/Microsoft/Windows NT/Audit/audit.csv'
@@ -245,36 +266,38 @@ try {
         Assert-True ($body.Count -eq 1 -and $body[0].Value -ceq $DefaultLogonText) 'Configured warning written'
         Assert-True ($script:bad.Count -eq 0) 'Banner needs no input'
     }
-    Test-Case 'Option 4 configures every password setting and NoLMHash' {
+    Test-Case 'Option 4 applies and verifies password policy and NoLMHash' {
         Reset-Records
         Set-PasswordPolicy
-        Assert-True ($script:nativeCalls.Count -eq 5) 'Four net calls and one secedit call'
-        Assert-True ($script:nativeCalls[3].Arguments[1] -eq '/minpwlen:14') 'Password setting interpolated'
+        Assert-True ($script:accountDesired.MinimumPasswordLength -eq 14 -and $script:accountDesired.PasswordComplexity -eq 1 -and $script:accountDesired.ClearTextPassword -eq 0) 'Desired policy applied'
         Assert-True (@($script:writes | Where-Object Name -eq 'NoLMHash').Count -eq 1) 'NoLMHash applied'
-        Assert-True ($script:bad.Count -eq 0 -and $script:good.Count -eq 1) 'Successful password result'
-        Assert-True (-not (Microsoft.PowerShell.Management\Test-Path (Join-Path $testTemp 'cp-pwpol.inf'))) 'Temporary policy cleaned'
+        Assert-True ($script:good.Count -eq 1 -and $script:bad.Count -eq 0) 'Verified password result'
     }
-    Test-Case 'Option 4 stops and reports a net.exe failure' {
-        Reset-Records; $script:failNative = 'net.exe'
+    Test-Case 'Option 4 reports a failed policy apply' {
+        Reset-Records;$script:failAccountApply=$true
         Set-PasswordPolicy
-        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'No false success'
-        Assert-True ($script:nativeCalls.Count -eq 1 -and $script:writes.Count -eq 0) 'Failed prerequisite stops changes'
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'No false policy success'
     }
-    Test-Case 'Option 4 reports secedit failure and cleans the temporary policy' {
-        Reset-Records; $script:failNative = 'secedit.exe'
+    Test-Case 'Option 4 stops when the policy backup fails' {
+        Reset-Records;$script:failNative='secedit.exe'
         Set-PasswordPolicy
-        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'No false secedit success'
-        Assert-True (-not (Microsoft.PowerShell.Management\Test-Path (Join-Path $testTemp 'cp-pwpol.inf'))) 'Cleanup runs on failure'
+        Assert-True ($script:accountDesired.Count -eq 0 -and $script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'No changes after backup failure'
     }
     Test-Case 'Option 4 does not report success when NoLMHash is rejected' {
-        Reset-Records; $script:failRegistryName = 'NoLMHash'
+        Reset-Records; $script:failRegistryName='NoLMHash'
         Set-PasswordPolicy
-        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -gt 0) 'Registry failure makes step incomplete'
+        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -gt 0) 'Registry failure reported'
     }
     Test-Case 'Option 5 reports a rejected lockout policy' {
-        Reset-Records; $script:failNative = 'net.exe'
+        Reset-Records;$script:failAccountApply=$true
         Set-LockoutPolicy
         Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'No false lockout success'
+    }
+    Test-Case 'Option 5 applies lockout values together and verifies them' {
+        Reset-Records
+        Set-LockoutPolicy
+        Assert-True ($script:accountDesired.LockoutBadCount -eq 5 -and $script:accountDesired.LockoutDuration -eq 30 -and $script:accountDesired.ResetLockoutCount -eq 30) 'Lockout triple applied'
+        Assert-True ($script:good.Count -eq 1 -and $script:bad.Count -eq 0) 'Lockout verified'
     }
     Test-Case 'Option 9 writes all UAC settings rather than invoking history' {
         Reset-Records
@@ -317,8 +340,8 @@ try {
         Reset-Records
         Enable-Auditing
         Assert-True ($script:writes.Count -eq 2) 'Both audit registry settings applied'
-        Assert-True (@($script:nativeCalls | Where-Object { $_.FilePath -eq 'LGPO.exe' -and $_.Arguments -contains '/b' }).Count -eq 1) 'Local GPO backed up'
-        Assert-True (@($script:nativeCalls | Where-Object { $_.FilePath -eq 'LGPO.exe' -and $_.Arguments -contains '/t' -and $_.Arguments -contains '/a' }).Count -eq 1) 'Registry.pol and audit policy imported'
+        Assert-True ($script:gpoSaves.Count -eq 1 -and $script:gpoSaves[0].Legacy) 'Native GPO save includes legacy categories'
+        Assert-True (@($script:nativeCalls | Where-Object { $_.FilePath -eq 'auditpol.exe' -and $_.Arguments -contains '/set' }).Count -eq 1) 'Built-in auditpol enables effective settings'
         Assert-True ($script:effectiveAudit.Count -eq 4 -and @($script:effectiveAudit | Where-Object { $_.'Setting Value' -ne '3' }).Count -eq 0) 'All discovered subcategories enabled'
         Assert-True ($script:good.Count -eq 1 -and $script:bad.Count -eq 0) 'Verified audit result'
     }
@@ -343,12 +366,10 @@ try {
         Enable-Auditing
         Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Required audit override detected'
     }
-    Test-Case 'Option 13 refuses to continue without the signed LGPO prerequisite' {
-        Reset-Records
-        function Get-LgpoExecutable { throw 'Microsoft signature invalid' }
+    Test-Case 'Option 13 stops when the native GPO save fails' {
+        Reset-Records;$script:failGpo=$true
         Enable-Auditing
-        Assert-True ($script:nativeCalls.Count -eq 0 -and $script:writes.Count -eq 0) 'No changes without prerequisite'
-        Assert-True ($script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'Missing prerequisite visible'
+        Assert-True ($script:writes.Count -eq 0 -and $script:good.Count -eq 0 -and $script:bad.Count -eq 1) 'No false GPO success'
     }
     Test-Case 'An individual walkthrough audit step preserves unrelated subcategory settings' {
         Reset-Records
@@ -363,21 +384,6 @@ try {
         $csv | Set-Content -LiteralPath $path -Encoding UTF8
         $rows = @(Read-SystemAuditPolicy -Path $path)
         Assert-True ($rows.Count -eq 4 -and $rows[0].'Setting Value' -eq '0') 'Localized headers do not lose policy rows'
-    }
-    Test-Case 'LGPO signature check accepts Microsoft and rejects unsigned or other publishers' {
-        $script:fakeSignature = [pscustomobject]@{Status='Valid'; SignerCertificate=[pscustomobject]@{Subject='CN=Microsoft Corporation, O=Microsoft Corporation, C=US'}}
-        function Get-AuthenticodeSignature { param($FilePath, $ErrorAction) $script:fakeSignature }
-        Assert-MicrosoftLgpoSignature -Path 'LGPO.exe'
-        foreach ($signature in @(
-            [pscustomobject]@{Status='NotSigned'; SignerCertificate=$null},
-            [pscustomobject]@{Status='HashMismatch'; SignerCertificate=[pscustomobject]@{Subject='O=Microsoft Corporation'}},
-            [pscustomobject]@{Status='Valid'; SignerCertificate=[pscustomobject]@{Subject='O=Other Publisher'}}
-        )) {
-            $script:fakeSignature = $signature
-            $caught = $false
-            try { Assert-MicrosoftLgpoSignature -Path 'LGPO.exe' } catch { $caught = $true }
-            Assert-True $caught 'Invalid or wrong-publisher executable rejected'
-        }
     }
     Test-Case 'Option 15 handles every advanced registry call including UNC names' {
         Reset-Records
